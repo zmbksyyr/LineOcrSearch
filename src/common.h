@@ -64,9 +64,12 @@ struct SearchRequest {
 
 struct SearchOutcome {
     std::wstring keyword;
-    std::vector<ResultItem> items;
+    std::vector<ResultItem> items;    // 当前显示的（按文件分组、组内按行号）
+    std::vector<ResultItem> pending;  // 已命中但受「最多显示」限制暂存的，供「加载更多」
     int  scannedFiles = 0;
-    bool truncated    = false;
+    int  totalHits    = 0;            // 命中总条数（跨所有文件，受收集上限约束）
+    int  totalFiles   = 0;            // 有命中的文件数
+    bool truncated    = false;        // 收集阶段撞到上限，还有内容没进来
 };
 
 // ---- 数据目录布局（目录名集中在这里，改组织方式只动这一处）----

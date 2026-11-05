@@ -21,8 +21,11 @@ static const int   kMaxFileBytes  = 2 * 1024 * 1024;  // 单文件上限 2 MB
 // Office 文件里常有图片，2MB 太紧；正文抽取只跟文字量有关，放宽到 16MB
 static const int   kMaxOfficeBytes = 16 * 1024 * 1024;
 static const int   kMaxDepth      = 32;               // 递归深度上限，防目录环
-static const int   kHitsPerFile   = 100;              // 单文件命中上限（总量仍受“结果条数”约束，最高 100）
+static const int   kHitsPerFile   = 100;              // 单文件命中上限
 static const int   kMaxScanned    = 20000;            // 单次搜索最多检查的文件数
+// 一次搜索最多往内存里收多少条命中（含暂不显示的）。
+// 收满即停并标记 truncated；显示上限（maxResults）远小于它，剩下的给「加载更多」。
+static const int   kMaxCollect    = 8000;
 
 // ---------------- 小工具 ----------------
 
@@ -180,11 +183,24 @@ bool ExtractOfficeText(const std::wstring& path, std::wstring& outText);
 
 // ---------------- 主搜索 ----------------
 
+// 一个文件的全部命中（按行号升序）。先按文件收，再统一分配显示名额：
+// 旧逻辑是「遍历到哪算哪、凑满 maxResults 就停」，遍历顺序靠前的大文件能把名额吃光，
+// 其它文件的命中根本进不来，用户会误以为只有那一个文件命中了。
+struct FileBucket {
+    std::wstring path;
+    std::wstring relPath;
+    std::wstring fileName;
+    std::vector<ResultItem> hits;
+};
+
 struct Walker {
     const SearchRequest* req = nullptr;
     SearchOutcome* out = nullptr;
     std::vector<std::wstring> kws;      // 拆分后的关键词（已归一化 + 大写）；多词 = AND
     int before = 1, after = 4;
+
+    std::vector<FileBucket> buckets;    // 有命中的文件，按遍历顺序追加
+    int collected = 0;                  // 已收集条数（受 kMaxCollect 约束）
 
     void HandleFile(const std::wstring& full, const std::wstring& rel, const std::wstring& name,
                     unsigned size, unsigned long long mtime);
@@ -193,7 +209,7 @@ struct Walker {
 
 void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const std::wstring& name,
                         unsigned size, unsigned long long mtime) {
-    if ((int)out->items.size() >= req->maxResults) { out->truncated = true; return; }
+    if (collected >= kMaxCollect) { out->truncated = true; return; }
 
     std::wstring ext = LowerExt(name);
     bool isText = IsTextExt(ext);
@@ -221,8 +237,9 @@ void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const
     if (lines.empty()) return;
 
     int hits = 0;
+    size_t bucketIdx = buckets.size();     // 有命中才开始建桶
     for (size_t i = 0; i < lines.size() && hits < kHitsPerFile; ++i) {
-        if ((int)out->items.size() >= req->maxResults) { out->truncated = true; break; }
+        if (collected >= kMaxCollect) { out->truncated = true; break; }
 
         std::wstring lineUpper = UpperW(NormalizeWidth(lines[i]));
 
@@ -269,14 +286,24 @@ void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const
             if (k == (int)i) it.hitIndex = (int)it.context.size();
             it.context.push_back(lines[k]);
         }
-        out->items.push_back(std::move(it));
+
+        if (bucketIdx == buckets.size()) {
+            FileBucket b;
+            b.path = full;
+            b.relPath = rel;
+            b.fileName = name;
+            buckets.push_back(std::move(b));
+            bucketIdx = buckets.size() - 1;
+        }
+        buckets[bucketIdx].hits.push_back(std::move(it));
+        collected++;
         hits++;
     }
 }
 
 void Walker::Walk(const std::wstring& dir, const std::wstring& rel, int depth) {
     if (depth > kMaxDepth) return;
-    if ((int)out->items.size() >= req->maxResults) { out->truncated = true; return; }
+    if (collected >= kMaxCollect) { out->truncated = true; return; }
     if (out->scannedFiles > kMaxScanned) return;
 
     std::wstring pattern = JoinPath(dir, L"*");
@@ -309,7 +336,7 @@ void Walker::Walk(const std::wstring& dir, const std::wstring& rel, int depth) {
                 (unsigned long long)fd.ftLastWriteTime.dwLowDateTime;
             HandleFile(full, childRel, name, (unsigned)fd.nFileSizeLow, mtime);
         }
-        if ((int)out->items.size() >= req->maxResults) { out->truncated = true; break; }
+        if (collected >= kMaxCollect) { out->truncated = true; break; }
     } while (FindNextFileW(h, &fd));
 
     FindClose(h);
@@ -446,6 +473,54 @@ CacheBuildStats CacheBuildForDir(const std::wstring& dir,
     return b.st;
 }
 
+// ---------------- 显示名额分配 ----------------
+// 目标：让「命中的文件」都能露头，而不是被遍历顺序靠前的大文件吃光名额。
+// 做法是「水位分配」：每一轮给每个还有剩余命中的文件各 1 条，直到名额用完。
+// 效果是保底 1 条 + 命中多的文件分到的更多（其多余命中排在后面，可「加载更多」）。
+// 输出顺序按文件分组：组间命中数降序（同数按路径），组内保持行号升序。
+static void BuildOutcome(SearchOutcome& out, std::vector<FileBucket>& buckets, int maxResults) {
+    out.totalFiles = (int)buckets.size();
+    int total = 0;
+    for (size_t i = 0; i < buckets.size(); ++i) total += (int)buckets[i].hits.size();
+    out.totalHits = total;
+    if (buckets.empty() || total <= 0) return;
+
+    std::vector<size_t> order(buckets.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&buckets](size_t a, size_t b) {
+        size_t na = buckets[a].hits.size(), nb = buckets[b].hits.size();
+        if (na != nb) return na > nb;
+        return buckets[a].relPath < buckets[b].relPath;
+    });
+
+    if (maxResults < 1) maxResults = 1;
+    std::vector<int> alloc(buckets.size(), 0);
+    int slots = maxResults;
+    bool progressed = true;
+    while (slots > 0 && progressed) {
+        progressed = false;
+        for (size_t k = 0; k < order.size() && slots > 0; ++k) {
+            size_t bi = order[k];
+            if (alloc[bi] < (int)buckets[bi].hits.size()) {
+                alloc[bi]++;
+                slots--;
+                progressed = true;
+            }
+        }
+    }
+
+    out.items.reserve((size_t)maxResults);
+    for (size_t k = 0; k < order.size(); ++k) {
+        const size_t bi = order[k];
+        std::vector<ResultItem>& hits = buckets[bi].hits;
+        const int n = alloc[bi];
+        for (int j = 0; j < (int)hits.size(); ++j) {
+            if (j < n) out.items.push_back(std::move(hits[(size_t)j]));
+            else       out.pending.push_back(std::move(hits[(size_t)j]));
+        }
+    }
+}
+
 SearchOutcome RunSearch(const SearchRequest& req) {
     SearchOutcome out;
     out.keyword = req.keyword;
@@ -471,5 +546,6 @@ SearchOutcome RunSearch(const SearchRequest& req) {
     if (w.kws.empty()) return out;
     ContextSpan(req.contextLevel, w.before, w.after);
     w.Walk(req.rootDir, std::wstring(), 0);
+    BuildOutcome(out, w.buckets, req.maxResults);
     return out;
 }

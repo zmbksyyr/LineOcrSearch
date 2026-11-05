@@ -8,6 +8,7 @@
 static const int kCardGap = 8;
 static const int kCardPad = 12;
 static const int kSideMargin = 14;
+static const int kMoreH = 52;     // 底部「加载更多」条的高度
 // ---------------- 结果列表 ----------------
 
 // 卡片里文字可用的宽度（跟随窗口宽度变化）
@@ -179,28 +180,57 @@ static int ItemH(size_t i) {
 
 void RecalcTotalHeight() {
     int maxW = ContentWidth();
-    if (maxW != g_wrapW || g_itemH.size() != g.outcome.items.size() || g_wrapSeq != g.seq) {
-        g_wrapW = maxW;
-        g_wrapSeq = g.seq;
+    const bool widthChanged = (maxW != g_wrapW);
+    const bool newSearch    = (g_wrapSeq != g.seq);
+
+    if (widthChanged || newSearch || g_itemH.size() > g.outcome.items.size()) {
+        // 宽度变了 / 换了新结果：全部重测
         g_itemH.assign(g.outcome.items.size(), 0);
-        if (!g.outcome.items.empty()) {
-            HDC dc = GetDC(g_hwndList);
-            for (size_t i = 0; i < g.outcome.items.size(); ++i)
-                g_itemH[i] = MeasureItem(dc, g.outcome.items[i], maxW);
-            ReleaseDC(g_hwndList, dc);
+    } else if (g_itemH.size() < g.outcome.items.size()) {
+        // 「加载更多」只是尾巴变长：已测过的保留，只补后面的
+        g_itemH.resize(g.outcome.items.size(), 0);
+    }
+    g_wrapW = maxW;
+    g_wrapSeq = g.seq;
+
+    bool needMeasure = false;
+    for (size_t i = 0; i < g_itemH.size(); ++i) {
+        if (g_itemH[i] <= 0) { needMeasure = true; break; }
+    }
+    if (needMeasure && !g.outcome.items.empty()) {
+        HDC dc = GetDC(g_hwndList);
+        for (size_t i = 0; i < g.outcome.items.size(); ++i) {
+            if (g_itemH[i] <= 0) g_itemH[i] = MeasureItem(dc, g.outcome.items[i], maxW);
         }
+        ReleaseDC(g_hwndList, dc);
     }
 
     int h = 0;
     for (size_t i = 0; i < g_itemH.size(); ++i) h += g_itemH[i];
+    if (!g.outcome.pending.empty()) h += kMoreH;   // 底部「加载更多」条
     g.totalH = h;
 
-    // 窗口拉大后，原来滚到底的位置可能越界
+    // 窗口拉大 / 追加结果后，原来滚到底的位置可能越界
     RECT rc{};
     GetClientRect(g_hwndList, &rc);
     int maxScroll = g.totalH - rc.bottom;
     if (maxScroll < 0) maxScroll = 0;
     if (g.scrollY > maxScroll) g.scrollY = maxScroll;
+}
+
+// 「加载更多」条在客户区里的矩形（没有待加载内容时返回 false）
+static bool MoreStripRect(RECT& out) {
+    if (g.outcome.pending.empty()) return false;
+    RECT rc{};
+    GetClientRect(g_hwndList, &rc);
+    int top = 0;
+    for (size_t i = 0; i < g.outcome.items.size(); ++i) top += ItemH(i);
+    int sy = 10 + top - g.scrollY;
+    out.left   = kSideMargin;
+    out.right  = rc.right - kSideMargin;
+    out.top    = sy;
+    out.bottom = sy + kMoreH - kCardGap;
+    return true;
 }
 
 // 命中行：整行普通色，命中区间红字 + 淡红底（多关键词时可能有多个区间）
@@ -351,6 +381,29 @@ static void PaintList(HWND hwnd) {
         }
 
         y += ih;
+    }
+
+    // 底部「加载更多」：还有命中没显示时给一个明显的入口
+    if (!g.outcome.pending.empty()) {
+        int top = 0;
+        for (size_t i = 0; i < g.outcome.items.size(); ++i) top += ItemH(i);
+        int sy = 10 + top - g.scrollY;
+        RECT strip{ cardLeft, sy, cardRight, sy + kMoreH - kCardGap };
+        if (strip.bottom > 0 && strip.top < rc.bottom) {
+            theme::FillRoundRect(mem, strip, 8, theme::kCardBg);
+            theme::StrokeRoundRect(mem, strip, 8, theme::kBorder);
+            HGDIOBJ of = SelectObject(mem, theme::FontUI());
+            std::wstring tip = L"还有 " + std::to_wstring(g.outcome.pending.size()) +
+                               L" 条命中 · 点击加载更多（Ctrl+Enter）";
+            SIZE sz{};
+            GetTextExtentPoint32W(mem, tip.c_str(), (int)tip.size(), &sz);
+            int cx = strip.left + (strip.right - strip.left - sz.cx) / 2;
+            if (cx < strip.left + kCardPad) cx = strip.left + kCardPad;
+            SetTextColor(mem, theme::kTextSub);
+            TextOutW(mem, cx, strip.top + (strip.bottom - strip.top - g_lineH) / 2,
+                     tip.c_str(), (int)tip.size());
+            SelectObject(mem, of);
+        }
     }
 
     if (g.outcome.items.empty()) {
@@ -590,6 +643,15 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             int myInDoc = my + g.scrollY - 10;
             int y = 0;
+
+            // 底部「加载更多」条
+            RECT strip{};
+            if (MoreStripRect(strip) && my >= strip.top && my <= strip.bottom) {
+                SetFocus(hwnd);
+                ShowMoreResults();
+                return 0;
+            }
+
             g.selected = -1;
             for (size_t i = 0; i < g.outcome.items.size(); ++i) {
                 int ih = ItemH(i);
@@ -666,9 +728,18 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        case WM_SETCURSOR: {
+            // 「加载更多」条上用小手，提示可点
+            POINT p{};
+            RECT sr{};
+            if (GetCursorPos(&p) && ScreenToClient(hwnd, &p) &&
+                MoreStripRect(sr) && p.y >= sr.top && p.y <= sr.bottom) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            } else {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            }
             return TRUE;
+        }
         case WM_KEYDOWN:
             // 点过列表后焦点在这里，按键转发给主窗口的导航处理
             if (g_menuOpen) break;              // 菜单弹出期间不抢键盘

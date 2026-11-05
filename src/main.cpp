@@ -110,11 +110,19 @@ void SetLeftStatus(const std::wstring& s) {
 
 // 统计与鼠标位置：只在搜索完成或方式变化时更新
 static void SetStatus() {
-    g_statusRight = L"命中 " + std::to_wstring(g.outcome.items.size()) + L" 条";
-    if (g.outcome.scannedFiles > 0) {
+    const int shown = (int)g.outcome.items.size();
+    const int total = g.outcome.totalHits > 0 ? g.outcome.totalHits : shown;
+    g_statusRight = L"命中 " + std::to_wstring(total) + L" 条";
+    if (g.outcome.totalFiles > 0) {
+        g_statusRight += L" · " + std::to_wstring(g.outcome.totalFiles) + L" 个文件";
+    }
+    if (shown > 0 && shown < total) {
+        g_statusRight += L" · 显示 " + std::to_wstring(shown) + L" 条";
+    }
+    if (g.outcome.truncated && g.outcome.pending.empty()) g_statusRight += L" · 结果已截断";
+    if (total == 0 && g.outcome.scannedFiles > 0) {
         g_statusRight += L" · 扫描 " + std::to_wstring(g.outcome.scannedFiles) + L" 个文件";
     }
-    if (g.outcome.truncated) g_statusRight += L" · 已截断";
     if (!g.statusNote.empty()) g_statusRight += L" · " + g.statusNote;
 
     g_statusMid = ModeName();
@@ -238,6 +246,11 @@ static void EditSetUsed(size_t used) {
 static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM wp, LPARAM lp,
                                      UINT_PTR id, DWORD_PTR ref) {
     if (m == WM_KEYDOWN && wp == VK_RETURN) {
+        // Ctrl+Enter = 加载更多，交给主窗口处理；单独 Enter 才是搜索
+        if (GetKeyState(VK_CONTROL) & 0x8000) {
+            if (g_hwndMain) PostMessageW(g_hwndMain, WM_KEYDOWN, VK_RETURN, lp);
+            return 0;
+        }
         if (g_hwndMain) {
             PostMessageW(g_hwndMain, WM_COMMAND,
                          MAKEWPARAM(IDC_BTN_SEARCH, BN_CLICKED), 0);
@@ -611,6 +624,25 @@ static void OnPollTick() {
     return;
 }
 
+// 「加载更多」：把暂存的命中按批追加到列表末尾（不重新搜索，纯内存搬运）
+void ShowMoreResults() {
+    if (g.outcome.pending.empty()) return;
+    const size_t kBatch = 50;
+    size_t take = g.outcome.pending.size();
+    if (take > kBatch) take = kBatch;
+
+    g.outcome.items.reserve(g.outcome.items.size() + take);
+    for (size_t i = 0; i < take; ++i) {
+        g.outcome.items.push_back(std::move(g.outcome.pending[i]));
+    }
+    g.outcome.pending.erase(g.outcome.pending.begin(),
+                            g.outcome.pending.begin() + (std::ptrdiff_t)take);
+
+    RecalcTotalHeight();
+    InvalidateRect(g_hwndList, nullptr, TRUE);
+    SetStatus();
+}
+
 static void OnResults(SearchResultMsg* msg) {
     bool needBacktrack = false;
     std::wstring nextKw;
@@ -870,6 +902,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // 不依赖焦点的几个：Ctrl+F 回搜索框、F5 重搜
             if (ctrl && (wp == L'F' || wp == 'F')) { FocusSearchBox(); return 0; }
+            // Ctrl+Enter：加载更多（不用先把焦点挪到列表底部的「加载更多」条）
+            if (ctrl && wp == VK_RETURN) { ShowMoreResults(); return 0; }
             if (wp == VK_F5) {
                 if (g.settings.rootDir.empty()) { g.statusNote = L"请先拖一个文件夹到窗口"; SetStatus(); }
                 else StartSearch(EditText());
