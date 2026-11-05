@@ -18,6 +18,11 @@ static std::string          g_outName;
 static std::vector<std::wstring> g_dict;
 static std::wstring         g_info;
 
+// 检测模型（DBNet）：给行框，代替投影猜行。可选——加载失败只是回退投影。
+static OrtSession*          g_detSess    = nullptr;
+static std::string          g_detInName;
+static std::string          g_detOutName;
+
 // ---------------- 小工具 ----------------
 
 static std::wstring U2W(const std::string& s) {
@@ -146,12 +151,38 @@ bool OcrInit(std::wstring& err) {
 
     g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_mem);
 
-    g_info = L"模型识别就绪 · 字典 " + std::to_wstring(g_dict.size()) + L" 字";
+    // 检测模型（可选）：缺文件或加载失败不影响识别，只是回退投影分行
+    std::wstring detPath = JoinPath(SubDirPath(cfgpaths::kModelDir), L"det.onnx");
+    if (FileExists(detPath)) {
+        std::vector<char> dm;
+        if (ReadAllBytes(detPath, dm)) {
+            OrtStatus* st2 = g_ort->CreateSessionFromArray(g_env, dm.data(), dm.size(), g_opts, &g_detSess);
+            if (st2) { g_ort->ReleaseStatus(st2); g_detSess = nullptr; }
+            else {
+                char* nm2 = nullptr;
+                g_ort->SessionGetInputName(g_detSess, 0, alloc, &nm2);
+                if (nm2) { g_detInName = nm2; alloc->Free(alloc, nm2); }
+                nm2 = nullptr;
+                g_ort->SessionGetOutputName(g_detSess, 0, alloc, &nm2);
+                if (nm2) { g_detOutName = nm2; alloc->Free(alloc, nm2); }
+                if (g_detInName.empty() || g_detOutName.empty()) {
+                    g_ort->ReleaseSession(g_detSess);
+                    g_detSess = nullptr;
+                    g_detInName.clear();
+                    g_detOutName.clear();
+                }
+            }
+        }
+    }
+
+    g_info = L"模型识别就绪 · 字典 " + std::to_wstring(g_dict.size()) + L" 字" +
+             (g_detSess ? L" · 检测就绪" : L"");
     return true;
 }
 
 void OcrShutdown() {
     if (g_ort) {
+        if (g_detSess) { g_ort->ReleaseSession(g_detSess); g_detSess = nullptr; }
         if (g_mem) { g_ort->ReleaseMemoryInfo(g_mem); g_mem = nullptr; }
         if (g_sess) { g_ort->ReleaseSession(g_sess); g_sess = nullptr; }
         if (g_opts) { g_ort->ReleaseSessionOptions(g_opts); g_opts = nullptr; }
@@ -160,6 +191,8 @@ void OcrShutdown() {
     if (g_dll) { FreeLibrary(g_dll); g_dll = nullptr; }
     g_ort = nullptr;
     g_dict.clear();
+    g_detInName.clear();
+    g_detOutName.clear();
     g_info.clear();
 }
 
@@ -341,6 +374,316 @@ static std::wstring CtcDecode(const float* data, int T, int C, int srcW,
     return res;
 }
 
+// ---------------- det 检测模型：给行框 ----------------
+
+static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
+                          int top, int bottom,
+                          std::wstring& text, std::vector<double>* charX);
+
+// right / bottom 为排他边界（与 PaddleOCR 一致）
+struct DetBox { int left = 0, top = 0, right = 0, bottom = 0; };
+
+// 前处理：限边 960 + 边长补 32；灰度复制 3 通道；ImageNet 均值方差归一化。
+// 后处理：0.3 阈值二值化 -> 连通域 -> 近似 unclip 外扩（DBNet 输出的是收缩框）。
+static bool OcrDetBoxes(const std::vector<unsigned char>& gray, int w, int h,
+                        std::vector<DetBox>& out) {
+    out.clear();
+    if (!g_detSess || g_detInName.empty() || g_detOutName.empty()) return false;
+    if (w <= 0 || h <= 0 || gray.size() != (size_t)w * h) return false;
+
+    // 缩放策略：小图上采样（文字太小 DBNet 会漏检），大图下采样，上限控制耗时。
+    double scale = 1.0;
+    int mw = w, mh = h;
+    int maxSide = (w > h ? w : h);
+    int minSide = (w < h ? w : h);
+    if (maxSide > 1280) {
+        scale = 1280.0 / (double)maxSide;
+    } else if (minSide < 320 && maxSide < 1280) {
+        scale = 320.0 / (double)minSide;                 // 上采样到短边 320
+        double cap = 1280.0 / (double)maxSide;           // 但长边不超过 1280
+        if (scale > cap) scale = cap;
+    }
+    if (scale != 1.0) {
+        mw = (int)std::lround(w * scale); if (mw < 32) mw = 32;
+        mh = (int)std::lround(h * scale); if (mh < 32) mh = 32;
+    }
+    int pw = (mw + 31) / 32 * 32;
+    int ph = (mh + 31) / 32 * 32;
+    if (pw < 32 || ph < 32 || pw > 2048 || ph > 2048) return false;
+
+    static const float kMean[3] = { 0.485f, 0.456f, 0.406f };
+    static const float kStd[3]  = { 0.229f, 0.224f, 0.225f };
+    size_t plane = (size_t)ph * pw;
+    std::vector<float> input(plane * 3, 0.0f);
+    for (int y = 0; y < mh; ++y) {
+        int sy = (scale < 1.0) ? (int)(y / scale) : y;
+        if (sy >= h) sy = h - 1;
+        const unsigned char* row = &gray[(size_t)sy * w];
+        for (int x = 0; x < mw; ++x) {
+            int sx = (scale < 1.0) ? (int)(x / scale) : x;
+            if (sx >= w) sx = w - 1;
+            float v = row[sx] / 255.0f;
+            size_t idx = (size_t)y * pw + x;
+            input[idx]                = (v - kMean[0]) / kStd[0];
+            input[idx + plane]        = (v - kMean[1]) / kStd[1];
+            input[idx + plane * 2]    = (v - kMean[2]) / kStd[2];
+        }
+    }
+
+    int64_t shape[4] = { 1, 3, ph, pw };
+    OrtValue* inVal = nullptr;
+    OrtStatus* st = g_ort->CreateTensorWithDataAsOrtValue(
+        g_mem, input.data(), input.size() * sizeof(float), shape, 4,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inVal);
+    if (st) { g_ort->ReleaseStatus(st); return false; }
+
+    const char* inNames[1]  = { g_detInName.c_str() };
+    const char* outNames[1] = { g_detOutName.c_str() };
+    OrtValue* outVal = nullptr;
+    st = g_ort->Run(g_detSess, nullptr, inNames, &inVal, 1, outNames, 1, &outVal);
+    g_ort->ReleaseValue(inVal);
+    if (st) { g_ort->ReleaseStatus(st); return false; }
+
+    bool ok = false;
+    OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (!g_ort->GetTensorTypeAndShape(outVal, &tsi) && tsi) {
+        size_t nd = 0;
+        g_ort->GetDimensionsCount(tsi, &nd);
+        int64_t dims[8] = { 0 };
+        if (nd >= 2 && nd <= 8) {
+            g_ort->GetDimensions(tsi, dims, nd);
+            int oh = (int)dims[nd - 2], ow = (int)dims[nd - 1];
+            void* raw = nullptr;
+            if (oh > 0 && ow > 0 && (long long)oh * ow <= (long long)2048 * 2048 &&
+                !g_ort->GetTensorMutableData(outVal, &raw) && raw) {
+                const float* map = (const float*)raw;
+
+                const float kThresh = 0.3f;
+                std::vector<unsigned char> bin((size_t)oh * ow, 0);
+                for (size_t i = 0; i < bin.size(); ++i) bin[i] = map[i] > kThresh ? 1 : 0;
+
+                std::vector<int> stack;
+                std::vector<DetBox> raws;
+                for (int y = 0; y < oh; ++y) {
+                    for (int x = 0; x < ow; ++x) {
+                        size_t i0 = (size_t)y * ow + x;
+                        if (!bin[i0]) continue;
+                        stack.clear();
+                        stack.push_back((int)i0);
+                        bin[i0] = 0;
+                        int minX = x, maxX = x, minY = y, maxY = y;
+                        while (!stack.empty()) {
+                            int cur = stack.back();
+                            stack.pop_back();
+                            int cy = cur / ow, cx = cur - cy * ow;
+                            if (cx < minX) minX = cx;
+                            if (cx > maxX) maxX = cx;
+                            if (cy < minY) minY = cy;
+                            if (cy > maxY) maxY = cy;
+                            if (cx > 0      && bin[cur - 1])  { bin[cur - 1] = 0;  stack.push_back(cur - 1); }
+                            if (cx < ow - 1 && bin[cur + 1])  { bin[cur + 1] = 0;  stack.push_back(cur + 1); }
+                            if (cy > 0      && bin[cur - ow]) { bin[cur - ow] = 0; stack.push_back(cur - ow); }
+                            if (cy < oh - 1 && bin[cur + ow]) { bin[cur + ow] = 0; stack.push_back(cur + ow); }
+                        }
+                        if (maxX - minX + 1 >= 2 && maxY - minY + 1 >= 2)
+                            raws.push_back(DetBox{ minX, minY, maxX + 1, maxY + 1 });
+                    }
+                }
+
+                double inv = (scale > 0.0) ? 1.0 / scale : 1.0;
+                for (const DetBox& r : raws) {
+                    int bw = r.right - r.left, bh = r.bottom - r.top;
+                    // 近似 unclip：offset = area * ratio / perimeter（ratio 1.5，矩形公式）
+                    double off = (double)bw * bh * 1.5 / (2.0 * (bw + bh));
+                    if (off < 1.5) off = 1.5;
+                    if (off > 24.0) off = 24.0;
+                    int l = (int)std::floor((r.left - off) * inv);
+                    int t2 = (int)std::floor((r.top - off) * inv);
+                    int rr = (int)std::ceil((r.right + off) * inv);
+                    int bb = (int)std::ceil((r.bottom + off) * inv);
+                    if (l < 0) l = 0;
+                    if (t2 < 0) t2 = 0;
+                    if (rr > w) rr = w;
+                    if (bb > h) bb = h;
+                    if (rr - l < 6 || bb - t2 < 4) continue;
+                    out.push_back(DetBox{ l, t2, rr, bb });
+                }
+                if (out.size() > 64) out.resize(64);
+#ifdef DET_DEBUG
+                for (const DetBox& b : out)
+                    printf("[det] band-box (%d,%d)-(%d,%d)\n", b.left, b.top, b.right, b.bottom);
+#endif
+                ok = true;
+            }
+        }
+        g_ort->ReleaseTensorTypeAndShapeInfo(tsi);
+    }
+    g_ort->ReleaseValue(outVal);
+    return ok;
+}
+
+// 裁出单个行框送识别模型，charX 已折算回条带坐标
+static bool RecognizeBox(const std::vector<unsigned char>& gray, int w,
+                         const DetBox& b, std::wstring& t, std::vector<double>& xs) {
+    t.clear();
+    xs.clear();
+    int bw = b.right - b.left, bh = b.bottom - b.top;
+    if (bw < 6 || bh < 5 || b.left < 0 || b.top < 0 ||
+        b.right > w || b.bottom > (int)(gray.size() / (size_t)w)) return false;
+
+    std::vector<unsigned char> crop((size_t)bw * bh);
+    for (int y = 0; y < bh; ++y)
+        memcpy(&crop[(size_t)y * bw], &gray[(size_t)(b.top + y) * w + b.left], (size_t)bw);
+
+    if (!RecognizeSpan(crop, bw, bh, 0, bh - 1, t, &xs)) return false;
+    for (double& v : xs) v += b.left;
+    return !t.empty();
+}
+
+// 同一视觉行的框横向拼接时的最大间隙：超过它就是列间空白，插一个全角逗号
+// 当切段分隔符（切段逻辑按标点切开，笔尖落在哪段就取哪段）。
+static const int kDetJoinGap = 40;
+
+// 检测框预合并：DBNet 在小字上会把一句话拆成若干碎框（甚至单字框），
+// 纵向同行且水平间隙不超过 1.5 倍字高的框先合并成完整文字块，再送识别。
+static std::vector<DetBox> MergeDetBoxes(const std::vector<DetBox>& boxes) {
+    std::vector<DetBox> v(boxes);
+    std::sort(v.begin(), v.end(), [](const DetBox& a, const DetBox& b) {
+        if (a.left != b.left) return a.left < b.left;
+        return a.top < b.top;
+    });
+    std::vector<DetBox> out;
+    for (const DetBox& b : v) {
+        bool merged = false;
+        for (DetBox& o : out) {
+            int ov = std::min(o.bottom, b.bottom) - std::max(o.top, b.top);
+            int minH = std::min(o.bottom - o.top, b.bottom - b.top);
+            if (ov * 2 < minH) continue;                        // 不同行
+            int gap = b.left - o.right;
+            int allow = (int)(1.5 * minH);
+            if (allow < 16) allow = 16;
+            if (gap <= allow) {
+                if (b.right > o.right) o.right = b.right;
+                if (b.top < o.top) o.top = b.top;
+                if (b.bottom > o.bottom) o.bottom = b.bottom;
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) out.push_back(b);
+    }
+    return out;
+}
+
+// 按检测框聚视觉行 -> 候选行按与鼠标 Y 距离排序 -> 行内框按 x 拼接识别 ->
+// TakeRightOfCursor 做「笔尖右侧 + 空白门槛 + 切段」判定。
+static bool OcrPickFromDet(const std::vector<DetBox>& boxes,
+                           const std::vector<unsigned char>& gray, int w, int h,
+                           int mouseX, int mouseY,
+                           std::wstring& text, int* lineTop, int* lineBottom,
+                           std::vector<double>* charX) {
+    std::vector<DetBox> merged = MergeDetBoxes(boxes);
+    const DetBox* boxesP = merged.data();
+    int nBoxes = (int)merged.size();
+#ifdef DET_DEBUG
+    printf("[det] mouse=(%d,%d) raw=%d merged=%d\n", mouseX, mouseY, (int)boxes.size(), nBoxes);
+    for (int i = 0; i < nBoxes; ++i)
+        printf("[det] merged (%d,%d)-(%d,%d)\n", boxesP[i].left, boxesP[i].top, boxesP[i].right, boxesP[i].bottom);
+#endif
+
+    struct DLine { int top = 0, bottom = 0; std::vector<int> idx; };
+
+    // 按 top 排序后贪心聚类：纵向重叠 >= 矮者一半算同一行
+    std::vector<int> order(nBoxes);
+    for (int i = 0; i < (int)order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (boxesP[a].top != boxesP[b].top) return boxesP[a].top < boxesP[b].top;
+        return boxesP[a].left < boxesP[b].left;
+    });
+    std::vector<DLine> lines;
+    for (int oi : order) {
+        const DetBox& b = boxesP[oi];
+        int bh = b.bottom - b.top;
+        int best = -1, bestOv = 0;
+        for (int li = 0; li < (int)lines.size(); ++li) {
+            DLine& L = lines[li];
+            int ov = std::min(L.bottom, b.bottom) - std::max(L.top, b.top);
+            if (ov > bestOv) { bestOv = ov; best = li; }
+        }
+        if (best >= 0) {
+            DLine& L = lines[best];
+            int lh = L.bottom - L.top;
+            if (bestOv * 2 >= std::min(lh, bh)) {
+                if (b.top < L.top) L.top = b.top;
+                if (b.bottom > L.bottom) L.bottom = b.bottom;
+                L.idx.push_back(oi);
+                continue;
+            }
+        }
+        DLine L;
+        L.top = b.top;
+        L.bottom = b.bottom;
+        L.idx.push_back(oi);
+        lines.push_back(L);
+    }
+
+    // 候选行按「与鼠标 Y 的距离」排序，最多试 3 行
+    std::vector<std::pair<int, int>> cands;   // <dist, lineIndex>
+    cands.reserve(lines.size());
+    for (int li = 0; li < (int)lines.size(); ++li) {
+        const DLine& L = lines[li];
+        int d = (mouseY >= L.top - 2 && mouseY <= L.bottom + 2)
+                    ? 0
+                    : (mouseY < L.top - 2 ? (L.top - 2) - mouseY : mouseY - (L.bottom + 2));
+        cands.push_back(std::make_pair(d, li));
+    }
+    std::sort(cands.begin(), cands.end());
+    if (cands.size() > 3) cands.resize(3);
+
+    for (const auto& c : cands) {
+        DLine& L = lines[c.second];
+        std::sort(L.idx.begin(), L.idx.end(), [&](int a, int b) {
+            return boxesP[a].left < boxesP[b].left;
+        });
+
+        std::wstring combined;
+        std::vector<double> xs;
+        int prevRight = -1;
+        for (int bi : L.idx) {
+            std::wstring t;
+            std::vector<double> bx;
+            if (!RecognizeBox(gray, w, boxesP[bi], t, bx)) continue;
+            if (!combined.empty() && prevRight >= 0 &&
+                boxesP[bi].left - prevRight > kDetJoinGap) {
+                combined += L"，";
+                xs.push_back((prevRight + boxesP[bi].left) * 0.5);
+            }
+            combined += t;
+            xs.insert(xs.end(), bx.begin(), bx.end());
+            prevRight = boxesP[bi].right;
+        }
+        if (CountTextChars(combined) < 1) continue;
+
+        size_t ob = 0, oe = 0;
+        double fl = -1.0;
+        std::wstring seg = (xs.size() == combined.size())
+                               ? TakeRightOfCursor(combined, xs, (double)mouseX, &ob, &oe, &fl)
+                               : TakeRightOfCursor(combined, std::vector<double>(), 0.0);
+        if (CountTextChars(seg) < 2) continue;
+        if (fl >= 0 && fl - (double)mouseX > (double)kMaxRightGap) continue;
+
+        text = combined;
+        if (charX) {
+            if (xs.size() == combined.size()) *charX = xs;
+            else charX->clear();
+        }
+        if (lineTop) *lineTop = L.top;
+        if (lineBottom) *lineBottom = L.bottom;
+        return true;
+    }
+    return false;
+}
+
 // ---------------- 对外识别 ----------------
 
 // 对灰度图的 [top..bottom] 行（整幅宽度）跑一次模型，输出文字与每字 x 坐标
@@ -424,6 +767,27 @@ bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
 
     std::vector<unsigned char> gray;
     ToGray(bgra, w, h, gray);
+
+    // ---- 检测模型路径：行框来自 DBNet，「行」不再是投影猜的 ----
+    // 有框但都过不了「笔尖右侧」门槛 -> 直接报「笔尖右侧是空白」，不回退投影去猜。
+    bool detRan = false, detHadBoxes = false;
+    if (g_detSess) {
+        std::vector<DetBox> det;
+        if (OcrDetBoxes(gray, w, h, det)) {
+            detRan = true;
+            detHadBoxes = !det.empty();
+            if (OcrPickFromDet(det, gray, w, h, mouseX, mouseY,
+                               text, lineTop, lineBottom, charX)) {
+                return true;
+            }
+        }
+    }
+    if (detRan && detHadBoxes) {
+        if (reject) *reject = 1;
+        return false;
+    }
+
+    // ---- 投影兜底（检测模型缺失或整片无框时）----
 
     std::vector<LineSpan> spans;
     bool darkText = true;

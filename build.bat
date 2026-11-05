@@ -36,6 +36,7 @@ echo [build] embedding runtime resources into the exe ...
 build\pack.exe dist\LineOcrSearch.exe ^
   "runtime\onnxruntime.dll=res\runtime\onnxruntime.dll" ^
   "model\rec.onnx=res\model\rec.onnx" ^
+  "model\det.onnx=res\model\det.onnx" ^
   "model\ppocr_keys_v1.txt=res\model\ppocr_keys_v1.txt"
 
 if errorlevel 1 (
