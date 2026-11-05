@@ -3,6 +3,8 @@
 #include <uiautomation.h>
 #include <oleacc.h>
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 // ---------------- 小工具 ----------------
@@ -34,21 +36,22 @@ static IUIAutomation* GetUia() {
     return s_uia;
 }
 
-// 取控件全文并按行号切出目标行
+// 取控件全文并按行号切出目标行。RichEdit 的换行是 \r（不是 \r\n），
+// 只按 \n 切会把整个控件当成一行。
 static std::wstring LineFromText(const std::wstring& all, int wantLine) {
     if (wantLine < 0) wantLine = 0;
     int line = 0;
     size_t start = 0;
     for (size_t i = 0; i <= all.size(); ++i) {
-        if (i == all.size() || all[i] == L'\n') {
-            if (line == wantLine) {
-                size_t e = i;
-                if (e > start && all[e-1] == L'\r') --e;
-                return all.substr(start, e - start);
-            }
-            ++line;
-            start = i + 1;
+        bool end = (i == all.size()) || all[i] == L'\n' || all[i] == L'\r';
+        if (!end) continue;
+        if (line == wantLine) return all.substr(start, i - start);
+        ++line;
+        if (i < all.size() && all[i] == L'\r' &&
+            i + 1 < all.size() && all[i + 1] == L'\n') {
+            ++i;
         }
+        start = i + 1;
     }
     return std::wstring();
 }
@@ -61,6 +64,272 @@ static void FillUniformX(const std::wstring& t, const RECT& rc, std::vector<doub
     double step = (R - L) / (double)t.size();
     xs.reserve(t.size());
     for (size_t i = 0; i < t.size(); ++i) xs.push_back(L + step * ((double)i + 0.5));
+}
+
+// ---------------- 策略 1.5：TextPattern 逐字矩形 ----------------
+//
+// UIA 的文字是源文本（不会认错字），但很多程序（Chromium / Word）的
+// RangeFromPoint 返回的是整个段落，段落里的软换行又没有 \r\n，
+// 直接当“行”用会取到上一行/整段。可靠的做法是拿段落里每个字的
+// GetBoundingRectangles，按 y 聚成视觉行，再按鼠标 Y 选行。
+// 这样文字来自 UIA、位置也来自 UIA，不需要均匀估算。
+
+struct UiaGlyph {
+    std::wstring text;   // 一个 UTF-16 码元
+    RECT rc{};           // 屏幕矩形；失败时为 0
+};
+
+struct UiaLineData {
+    std::wstring text;
+    std::vector<double> xs;
+    RECT rc{};
+};
+
+static bool FirstGlyphRect(IUIAutomationTextRange* r, RECT& rc) {
+    SAFEARRAY* sa = nullptr;
+    if (FAILED(r->GetBoundingRectangles(&sa)) || !sa) return false;
+
+    LONG lb = 0, ub = -1;
+    if (FAILED(SafeArrayGetLBound(sa, 1, &lb)) ||
+        FAILED(SafeArrayGetUBound(sa, 1, &ub)) || ub < lb + 3) {
+        SafeArrayDestroy(sa);
+        return false;
+    }
+    double* p = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(SafeArrayAccessData(sa, (void**)&p)) && p) {
+        for (LONG i = lb; i + 3 <= ub; i += 4) {
+            if (p[i + 2] >= 2.0 && p[i + 3] >= 2.0) {
+                rc.left = (LONG)std::lround(p[i]);
+                rc.top = (LONG)std::lround(p[i + 1]);
+                rc.right = (LONG)std::lround(p[i] + p[i + 2]);
+                rc.bottom = (LONG)std::lround(p[i + 1] + p[i + 3]);
+                ok = true;
+                break;
+            }
+        }
+        SafeArrayUnaccessData(sa);
+    }
+    SafeArrayDestroy(sa);
+    return ok;
+}
+
+// 把段落范围逐字走一遍，拿到每个码元的文字和屏幕矩形。
+static bool CollectRangeGlyphs(IUIAutomationTextRange* para, std::vector<UiaGlyph>& out,
+                               int maxChars) {
+    out.clear();
+    IUIAutomationTextRange* r = nullptr;
+    if (FAILED(para->Clone(&r)) || !r) return false;
+    if (FAILED(r->MoveEndpointByRange(TextPatternRangeEndpoint_End, para,
+                                      TextPatternRangeEndpoint_Start))) {
+        r->Release();
+        return false;
+    }
+
+    RECT last{};
+    int moved = 0;
+    for (int i = 0; i < maxChars; ++i) {
+        if (FAILED(r->MoveEndpointByUnit(TextPatternRangeEndpoint_End,
+                                         TextUnit_Character, 1, &moved)) || moved == 0) {
+            break;
+        }
+        BSTR b = nullptr;
+        std::wstring t;
+        if (SUCCEEDED(r->GetText(8, &b)) && b) {
+            t.assign(b, SysStringLen(b));
+            SysFreeString(b);
+        }
+        RECT rc{};
+        bool have = FirstGlyphRect(r, rc);
+        if (!have) rc = last;
+        else last = rc;
+
+        for (wchar_t c : t) {
+            UiaGlyph g;
+            g.text.assign(1, c);
+            g.rc = rc;
+            out.push_back(g);
+        }
+        if (FAILED(r->MoveEndpointByUnit(TextPatternRangeEndpoint_Start,
+                                         TextUnit_Character, 1, &moved)) || moved == 0) {
+            break;
+        }
+    }
+    r->Release();
+    return !out.empty();
+}
+
+// 按矩形 top 聚视觉行；行内按 left 排序，拼出文字和每字中心 x。
+static void BuildVisualLines(const std::vector<UiaGlyph>& glyphs, std::vector<UiaLineData>& lines) {
+    lines.clear();
+    std::vector<int> order;
+    order.reserve(glyphs.size());
+    for (int i = 0; i < (int)glyphs.size(); ++i) {
+        const RECT& rc = glyphs[i].rc;
+        if (rc.right > rc.left && rc.bottom > rc.top && !glyphs[i].text.empty()) order.push_back(i);
+    }
+    if (order.empty()) return;
+
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (glyphs[a].rc.top != glyphs[b].rc.top) return glyphs[a].rc.top < glyphs[b].rc.top;
+        return glyphs[a].rc.left < glyphs[b].rc.left;
+    });
+
+    std::vector<int> group;
+    auto flush = [&]() {
+        if (group.empty()) return;
+        std::sort(group.begin(), group.end(), [&](int a, int b) {
+            return glyphs[a].rc.left < glyphs[b].rc.left;
+        });
+        UiaLineData line;
+        RECT rc = glyphs[group[0]].rc;
+        for (int idx : group) {
+            const RECT& g = glyphs[idx].rc;
+            line.text += glyphs[idx].text;
+            line.xs.push_back(((double)g.left + (double)g.right) * 0.5);
+            if (g.left < rc.left) rc.left = g.left;
+            if (g.top < rc.top) rc.top = g.top;
+            if (g.right > rc.right) rc.right = g.right;
+            if (g.bottom > rc.bottom) rc.bottom = g.bottom;
+        }
+        line.rc = rc;
+        lines.push_back(std::move(line));
+        group.clear();
+    };
+
+    LONG curTop = glyphs[order[0]].rc.top;
+    for (int idx : order) {
+        LONG top = glyphs[idx].rc.top;
+        if (std::labs((long)top - (long)curTop) > 4) {
+            flush();
+            curTop = top;
+        }
+        group.push_back(idx);
+    }
+    flush();
+}
+
+static void AddPatternAt(IUIAutomationElement* el, std::vector<IUIAutomationTextPattern*>& out) {
+    if (!el) return;
+    IUIAutomationTextPattern* tp = nullptr;
+    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_TextPatternId, IID_IUIAutomationTextPattern,
+                                          (void**)&tp)) && tp) {
+        out.push_back(tp);
+    }
+}
+
+// 在鼠标点附近找一个 TextPattern 范围：从点到右侧逐级试探，
+// 这样鼠标停在行首左边/页边距时也能命中同一行。
+// 注意：Chromium 在文字上返回的 range 可能是退化的（GetText 为空），
+// 但 ExpandToEnclosingUnit(Paragraph) 之后就能拿到整段，所以这里不按 GetText 过滤。
+static IUIAutomationTextRange* RangeNearPoint(IUIAutomationTextPattern* tp, POINT pt) {
+    static const int kOffsets[] = { 0, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
+    for (int dx : kOffsets) {
+        POINT q{ pt.x + dx, pt.y };
+        IUIAutomationTextRange* r = nullptr;
+        if (SUCCEEDED(tp->RangeFromPoint(q, &r)) && r) return r;
+    }
+    return nullptr;
+}
+
+static bool UiaVisualLineAtPoint(POINT pt, std::wstring& outText, std::wstring& source,
+                                 RECT* outRect, std::vector<double>* charX) {
+    IUIAutomation* uia = GetUia();
+    if (!uia) return false;
+
+    IUIAutomationElement* el = nullptr;
+    if (FAILED(uia->ElementFromPoint(pt, &el)) || !el) return false;
+
+    std::vector<IUIAutomationTextPattern*> patterns;
+    AddPatternAt(el, patterns);
+
+    IUIAutomationTreeWalker* walker = nullptr;
+    uia->get_ControlViewWalker(&walker);
+    IUIAutomationElement* cur = el;
+    cur->AddRef();
+    for (int depth = 0; depth < 8 && patterns.size() < 3; ++depth) {
+        IUIAutomationElement* parent = nullptr;
+        if (!walker || FAILED(walker->GetParentElement(cur, &parent)) || !parent) break;
+        cur->Release();
+        cur = parent;
+        AddPatternAt(cur, patterns);
+    }
+    cur->Release();
+    if (walker) walker->Release();
+
+    // 有些程序（部分 Electron / 内嵌浏览器）把 TextPattern 放在 Document 后代上，
+    // 而不是当前元素或祖先；前面没找到时再向下找一层 Document。
+    if (patterns.empty()) {
+        IUIAutomationCondition* cond = nullptr;
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_I4;
+        v.lVal = UIA_DocumentControlTypeId;
+        if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &cond)) && cond) {
+            IUIAutomationElementArray* arr = nullptr;
+            if (SUCCEEDED(el->FindAll(TreeScope_Descendants, cond, &arr)) && arr) {
+                int n = 0;
+                arr->get_Length(&n);
+                if (n > 4) n = 4;
+                for (int i = 0; i < n; ++i) {
+                    IUIAutomationElement* d = nullptr;
+                    if (SUCCEEDED(arr->GetElement(i, &d)) && d) {
+                        AddPatternAt(d, patterns);
+                        d->Release();
+                    }
+                }
+                arr->Release();
+            }
+            cond->Release();
+        }
+    }
+
+    bool ok = false;
+    for (IUIAutomationTextPattern* tp : patterns) {
+        IUIAutomationTextRange* r = RangeNearPoint(tp, pt);
+        if (!r) continue;
+
+        IUIAutomationTextRange* para = nullptr;
+        if (FAILED(r->Clone(&para)) || !para) { r->Release(); continue; }
+        para->ExpandToEnclosingUnit(TextUnit_Paragraph);
+
+        std::vector<UiaGlyph> glyphs;
+        if (!CollectRangeGlyphs(para, glyphs, 3000)) {
+            para->Release();
+            r->Release();
+            continue;
+        }
+        para->Release();
+        r->Release();
+
+        std::vector<UiaLineData> lines;
+        BuildVisualLines(glyphs, lines);
+        int pick = -1, pickH = 1 << 30;
+        for (int i = 0; i < (int)lines.size(); ++i) {
+            const RECT& rc = lines[i].rc;
+            int hgt = rc.bottom - rc.top + 1;
+            int tol = hgt / 4;
+            if (tol < 2) tol = 2;
+            if (tol > 8) tol = 8;
+            if (pt.y >= rc.top - tol && pt.y <= rc.bottom + tol) {
+                if (hgt < pickH) { pickH = hgt; pick = i; }
+            }
+        }
+        if (pick < 0) continue;
+
+        const UiaLineData& line = lines[pick];
+        if (line.text.empty() || line.xs.size() != line.text.size()) continue;
+        outText = line.text;
+        if (charX) *charX = line.xs;
+        if (outRect) *outRect = line.rc;
+        source = L"UIA 文字行";
+        ok = true;
+        break;
+    }
+
+    for (IUIAutomationTextPattern* tp : patterns) tp->Release();
+    el->Release();
+    return ok;
 }
 
 // ---------------- 策略 1：原生 EDIT / RichEdit 精确取行 ----------------
@@ -93,7 +362,7 @@ static bool TryNativeEditLine(POINT pt, std::wstring& out, std::wstring& source,
     int charIdx = -1;
     if (isRich) {
         LRESULT r = SendMessageW(h, EM_CHARFROMPOS, 0, MAKELPARAM(c.x, c.y));
-        charIdx = (int)(short)LOWORD(r);
+        charIdx = (int)LOWORD(r);
     } else {
         LRESULT r = SendMessageW(h, EM_CHARFROMPOS, 0, MAKELPARAM(c.x, c.y));
         charIdx = (int)LOWORD(r);
@@ -183,33 +452,9 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
 
     bool ok = false;
 
-    // 2a) TextPattern.RangeFromPoint（部分程序可用）
-    IUIAutomationTextPattern* tp = nullptr;
-    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_TextPatternId, IID_IUIAutomationTextPattern,
-                                          (void**)&tp)) && tp) {
-        IUIAutomationTextRange* r = nullptr;
-        if (SUCCEEDED(tp->RangeFromPoint(pt, &r)) && r) {
-            BSTR t = nullptr;
-            if (SUCCEEDED(r->GetText(512, &t))) {
-                std::wstring s = TakeBstr(t);
-                s = TrimW3(s);
-                if (s.size() >= 1) {
-                    // RangeFromPoint 可能返回整段；取第一行
-                    size_t nl = s.find_first_of(L"\r\n");
-                    if (nl != std::wstring::npos) s = s.substr(0, nl);
-                    s = TrimW3(s);
-                    if (!s.empty()) {
-                        out = s;
-                        source = L"UIA 文本范围";
-                        ok = true;
-                        if (outRect) *outRect = elRect;
-                    }
-                }
-            }
-            r->Release();
-        }
-        tp->Release();
-    }
+    // 2a) 不再用 RangeFromPoint 返回的段落文字直接当行：
+    //     Chromium 的软换行没有 \r\n，整段会被误当成一行。
+    //     逐字矩形路径（UiaVisualLineAtPoint）已经能给出真正的视觉行。
 
     // 2b) 几何聚行：把 Descendants 中 Text 类型且纵向覆盖鼠标点的元素按 left 拼接
     if (!ok) {
@@ -240,7 +485,7 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
                             bool coversY = (pt.y >= rc.top && pt.y <= rc.bottom);
                             bool atRight = (rc.right >= pt.x - 24);
                             // 左边也不能太远：整块空白那头的元素（别的栏、别的窗口）不要
-                            bool notFarRight = (rc.left <= pt.x + kMaxRightGap);
+                            bool notFarRight = (rc.left <= pt.x + MaxRightGap(20));
                             if (coversY && atRight && notFarRight && hgt > 0 && hgt <= 120 && wid <= 2000) {
                                 BSTR nm = nullptr;
                                 if (SUCCEEDED(c->get_CurrentName(&nm)) && nm) {
@@ -346,10 +591,17 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
     }
 
     // 2c) 元素自身 Name（按钮 / 标签 / 单行输入框）
-    //     只在「内容型」控件上采信，否则鼠标停在窗口空白处会取到窗口标题这种没用的文字
+    //     只在「内容型且像一行」的控件上采信：整段/多行文本的 Name 不能当行用。
     if (!ok) {
         CONTROLTYPEID ct = 0;
         el->get_CurrentControlType(&ct);
+        long elH = elRect.bottom - elRect.top;
+        long elW = elRect.right - elRect.left;
+        bool textish = (ct == UIA_TextControlTypeId ||
+                        ct == UIA_ListItemControlTypeId ||
+                        ct == UIA_DataItemControlTypeId);
+        // 文本类控件只有“明显是一行”才用 Name；整段/多行的 Name 会取到上一行。
+        bool lineLike = (elH > 0 && elH <= (textish ? 32 : 48) && elW > 0 && elW <= 2000);
         bool contentLike = (ct == UIA_TextControlTypeId ||
                             ct == UIA_ButtonControlTypeId ||
                             ct == UIA_EditControlTypeId ||
@@ -359,7 +611,7 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
                             ct == UIA_MenuItemControlTypeId ||
                             ct == UIA_CheckBoxControlTypeId ||
                             ct == UIA_RadioButtonControlTypeId);
-        if (contentLike) {
+        if (contentLike && lineLike) {
             BSTR nm = nullptr;
             if (SUCCEEDED(el->get_CurrentName(&nm)) && nm) {
                 std::wstring s = TrimW3(TakeBstr(nm));
@@ -406,7 +658,7 @@ static bool TryMsaa(POINT pt, std::wstring& out, std::wstring& source, RECT* out
         bool lineLike = (wid > 0 && hgt > 0 && wid <= 2000 && hgt <= 200);
         bool coversY = (pt.y >= accRect.top - 8 && pt.y <= accRect.bottom + 8);
         bool nearX = (accRect.right >= pt.x - 24 &&
-                      accRect.left <= pt.x + kMaxRightGap);
+                      accRect.left <= pt.x + MaxRightGap(20));
         if (!lineLike || !coversY || !nearX) {
             acc->Release();
             return false;
@@ -484,6 +736,9 @@ bool CaptureTextLayer(POINT pt, std::wstring& text, std::wstring& source,
     if (outRect) { outRect->left = outRect->top = outRect->right = outRect->bottom = 0; }
 
     if (IUIAutomation* uia = GetUia()) {
+        // 首选：逐字矩形聚视觉行（文字和坐标都来自 UIA，最准）
+        if (UiaVisualLineAtPoint(pt, text, source, outRect, charX)) return true;
+        // 兜底：没有 TextPattern 的程序走几何聚行 / 控件名称
         if (TryUiaTextPattern(uia, pt, text, source, outRect, charX)) {
             if (charX && charX->size() != text.size() && outRect && outRect->right > outRect->left) {
                 FillUniformX(text, *outRect, *charX);
@@ -649,4 +904,3 @@ bool GetUiaDocumentText(POINT pt, const std::wstring& hint, std::wstring& text) 
     s_cacheTick = now;
     return true;
 }
-

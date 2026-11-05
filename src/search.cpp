@@ -62,18 +62,59 @@ static inline wchar_t FoldChar(wchar_t c) {
     return b;
 }
 
-// 在原始行里找已折叠的关键词：不分配，首字符对上了才逐字比
-static bool FindFolded(const std::wstring& line, const std::wstring& needle, size_t& at) {
+// 在原始行里找已折叠的关键词：不分配，首字符对上了才逐字比。
+// 含 CJK 的关键词忽略行内空白：OCR 常把「第4.1条 车站」里的空格吃掉，
+// 关键词变成「条车站」，不忽略空格就永远搜不到。
+static bool IsSpaceForMatch(wchar_t c) {
+    return c == L' ' || c == L'\t' || c == 0x3000;
+}
+
+static bool NeedSkipSpaces(const std::wstring& needle) {
+    for (wchar_t c : needle) {
+        if (c >= 0x2E80 && c <= 0x9FFF) return true;   // CJK
+        if (c >= 0xAC00 && c <= 0xD7AF) return true;   // 韩文
+        if (c >= 0xF900 && c <= 0xFAFF) return true;   // 兼容汉字
+    }
+    return false;
+}
+
+static bool FindFolded(const std::wstring& line, const std::wstring& needle, size_t& at,
+                       size_t* outEnd = nullptr) {
     const size_t n = line.size(), m = needle.size();
     if (m == 0 || n < m) return false;
     const wchar_t* lp = line.c_str();
     const wchar_t* np = needle.c_str();
     const wchar_t first = np[0];
-    for (size_t i = 0, last = n - m; i <= last; ++i) {
+
+    if (!NeedSkipSpaces(needle)) {
+        for (size_t i = 0, last = n - m; i <= last; ++i) {
+            if (FoldChar(lp[i]) != first) continue;
+            size_t j = 1;
+            while (j < m && FoldChar(lp[i + j]) == np[j]) ++j;
+            if (j == m) {
+                at = i;
+                if (outEnd) *outEnd = i + m;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (IsSpaceForMatch(lp[i])) continue;
         if (FoldChar(lp[i]) != first) continue;
-        size_t j = 1;
-        while (j < m && FoldChar(lp[i + j]) == np[j]) ++j;
-        if (j == m) { at = i; return true; }
+        size_t j = 0, k = i;
+        while (j < m) {
+            while (k < n && IsSpaceForMatch(lp[k])) ++k;
+            if (k >= n || FoldChar(lp[k]) != np[j]) break;
+            ++k;
+            ++j;
+        }
+        if (j == m) {
+            at = i;
+            if (outEnd) *outEnd = k;
+            return true;
+        }
     }
     return false;
 }
@@ -276,11 +317,11 @@ void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const
         std::vector<HitSpan> found;
         bool all = true;
         for (size_t k = 0; k < kws.size(); ++k) {
-            size_t p = 0;
-            if (!FindFolded(line, kws[k], p)) { all = false; break; }
+            size_t p = 0, e = 0;
+            if (!FindFolded(line, kws[k], p, &e)) { all = false; break; }
             HitSpan hs;
             hs.start = (int)p;
-            hs.len = (int)kws[k].size();
+            hs.len = (int)(e - p);
             found.push_back(hs);
         }
         if (!all) continue;

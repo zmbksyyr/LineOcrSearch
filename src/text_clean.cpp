@@ -187,19 +187,34 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     std::wstring s = raw.substr(i0);
     if (s.empty()) return std::wstring();
 
-    // 笔尖右侧的区域再按「非纯文字」切段（标点 / 括号 / 数字都是分隔符，
-    // 英文词间空格除外），取第一段有效文字：
-    //   「关于你问的「两端处理是不是误伤了」」-> 「关于你问的」；
+    // 笔尖右侧的区域按「非纯文字」切段（标点 / 括号 / 数字都是分隔符，
+    // 英文词间空格除外），取其中**最长的一段有效文字**：
+    //   「关于你问的「两端处理是不是误伤了」」-> 「两端处理是不是误伤了」；
     //   「已处理 7m59s」-> 「已处理」；「Microsoft Edge (8)」-> 「Microsoft Edge」。
-    // 首段不足 2 个文字字符就顺延到下一段；一段都没有时兜底取首段。
+    // 用户明确要求「取一大块纯文字去搜索」：数字和标点 OCR 不准，干脆不要；
+    // 短段（如「总则」「第」）搜出来命中太泛，优先更长的段。
     std::vector<Seg> segs;
     SplitSegments(s, segs);
     if (segs.empty()) return std::wstring();
 
-    size_t b = segs[0].b, e = segs[0].e;
+    size_t best = 0;
+    bool found = false;
+    int bestCount = 0;
+    size_t bestLen = 0;
     for (size_t k = 0; k < segs.size(); ++k) {
-        if (SegTextCount(s, segs[k]) >= 2) { b = segs[k].b; e = segs[k].e; break; }
+        int cnt = SegTextCount(s, segs[k]);
+        if (cnt < 2) continue;
+        size_t len = segs[k].e - segs[k].b;
+        if (!found || cnt > bestCount || (cnt == bestCount && len > bestLen)) {
+            found = true;
+            best = k;
+            bestCount = cnt;
+            bestLen = len;
+        }
     }
+    if (!found) return std::wstring();
+
+    size_t b = segs[best].b, e = segs[best].e;
 
     while (b < e && (s[b] == L' ' || s[b] == L'\t')) ++b;
     while (e > b && (s[e - 1] == L' ' || s[e - 1] == L'\t')) --e;
@@ -210,8 +225,9 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     if (outBegin) *outBegin = i0 + b;
     if (outEnd) *outEnd = i0 + e;
     if (haveX && firstLeft) {
-        // 第一个被采纳字符的左边缘：与相邻字符中心的中点近似
-        size_t i = i0 + b;
+        // 距离门槛看“鼠标右侧第一个字”，不是最后选中的长段：
+        // 只要这一行在鼠标右侧确实有文字，就可以在这行里挑最长的一段。
+        size_t i = i0;
         double half;
         if (i + 1 < raw.size() && charX[i + 1] > charX[i]) {
             half = (charX[i + 1] - charX[i]) * 0.5;

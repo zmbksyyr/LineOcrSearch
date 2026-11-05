@@ -111,20 +111,25 @@ std::wstring CleanOcrTextByX(const std::wstring& raw,
                              const std::vector<double>& charX, double mouseX);
 // 笔尖左锚点取词（主链路）：笔尖只是「从这里开始」的标记，不必压在字上。
 //   1) 找笔尖右侧第一个文字字符（笔尖落在某个字内部时，从该字算起）
-//   2) 从它截到行尾
-//   3) 两端去噪（空白 / 标点 / 符号 / 开头编号），中间原样保留
+//   2) 在右侧范围内按「非纯文字」切段，取最长的一段（至少 2 个文字字符）
+//   3) 两端去空白，中间原样保留
 // 认不出有效文字时返回空串，由调用方决定是否回退。
-// outBegin/outEnd（可选）返回这段在 raw 里的下标区间，便于就地替换文字而保留坐标。
-// firstLeft（可选）返回这段第一个字的左边缘（与 mouseX 同一坐标系）；
+// outBegin/outEnd（可选）返回这段在 raw 里的下标区间。
+// firstLeft（可选）返回鼠标右侧第一个字的左边缘（与 mouseX 同一坐标系）；
 //   没有坐标信息时不写。调用方用它判断「笔尖右侧是不是一片空白」。
 std::wstring TakeRightOfCursor(const std::wstring& raw,
                                const std::vector<double>& charX, double mouseX,
                                size_t* outBegin = nullptr, size_t* outEnd = nullptr,
                                double* firstLeft = nullptr);
 
-// 笔尖右侧空白门槛：第一个字离笔尖超过这个距离就算「右侧是空白」，
-// 不再把远处的文字（别的栏、别的窗口）抓进来。桌面上离 WorkBuddy 几百像素的实测依据。
-const int kMaxRightGap = 150;
+// 笔尖右侧空白门槛：第一个字离笔尖超过这个距离就算「右侧是空白 / 离文字太远」。
+// 以 150px 为下限，随行高放大，避免高 DPI 下逻辑像素变小。
+inline int MaxRightGap(int lineH) {
+    int g = lineH * 6;
+    if (g < 150) g = 150;
+    if (g > 300) g = 300;
+    return g;
+}
 // 两段文字的字符重合度 0..1（字符频次交集 / 较长者长度）。
 // 用来判断 UIA 与图片认的是不是同一句：差距大就以图片为准。
 double TextSimilarity(const std::wstring& a, const std::wstring& b);

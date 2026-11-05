@@ -88,33 +88,33 @@ static void TestTakeRight() {
     std::vector<double> xs;
     for (size_t i = 0; i < line.size(); ++i) xs.push_back(10.0 + 20.0 * (double)i);
 
-    // 锚点右侧区域要按标点切段，取第一段有效文字（不是整条尾巴）
-    Check(TakeRightOfCursor(line, xs, 0.0) == L"改为系统控件吧",
-          "cursor left of line -> first segment, tail punctuation dropped");
-    Check(TakeRightOfCursor(line, xs, 50.0) == L"系统控件吧",
-          "cursor inside a char -> that char's segment");
-    Check(TakeRightOfCursor(line, xs, 150.0) == L"这个也是丑陋",
-          "cursor on comma -> next segment, left side dropped");
+    // 锚点右侧区域要按标点切段，取最长的一段纯文字（数字/标点 OCR 不准，干脆不要）
+    Check(TakeRightOfCursor(line, xs, 0.0) == L"还不如用原生的好了",
+          "cursor left of line -> longest pure block");
+    Check(TakeRightOfCursor(line, xs, 50.0) == L"还不如用原生的好了",
+          "cursor inside a char -> longest pure block on the right");
+    Check(TakeRightOfCursor(line, xs, 150.0) == L"还不如用原生的好了",
+          "cursor on comma -> longest block, left side dropped");
     Check(TakeRightOfCursor(line, xs, 9000.0).empty(),
           "cursor right of all text -> empty, no guessing");
 
-    // 用户实例：括号引用是分隔符，两侧各自成段
+    // 用户实例：括号引用是分隔符，两侧各自成段，取较长的一段
     {
         const std::wstring quote = L"关于你问的「两端处理是不是误伤了」";
         std::vector<double> qx;
         for (size_t i = 0; i < quote.size(); ++i) qx.push_back(10.0 + 20.0 * (double)i);
-        Check(TakeRightOfCursor(quote, qx, 0.0) == L"关于你问的",
-              "bracket quote -> left segment");
+        Check(TakeRightOfCursor(quote, qx, 0.0) == L"两端处理是不是误伤了",
+              "bracket quote -> longer inner block");
         Check(TakeRightOfCursor(quote, qx, 110.0) == L"两端处理是不是误伤了",
-              "anchor inside quote -> inner segment");
+              "anchor inside quote -> longer inner block");
     }
 
-    // 行首编号 / 装饰符被剥掉（编号不是纯文字，切段时直接跳过）
+    // 行首编号 / 装饰符被剥掉；短段（总则）让位给更长的纯文字段
     const std::wstring numbered = L"（3）总则：本办法适用于全线。";
     std::vector<double> nx;
     for (size_t i = 0; i < numbered.size(); ++i) nx.push_back(10.0 + 20.0 * (double)i);
-    Check(TakeRightOfCursor(numbered, nx, 0.0) == L"总则",
-          "leading number + brackets cut; colon is a separator");
+    Check(TakeRightOfCursor(numbered, nx, 0.0) == L"本办法适用于全线",
+          "leading number + brackets cut; short heading skipped");
 
     // 任务管理器那种「名字后面跟计数」的写法：计数剥掉，英文词间空格保留
     const std::wstring proc = L"Microsoft Edge (8)";
@@ -127,7 +127,7 @@ static void TestTakeRight() {
     Check(TakeRightOfCursor(L"·【应收账款】·", std::vector<double>(), 0.0) == L"应收账款",
           "no positions -> trim both ends only");
 
-    // firstLeft：第一个被采纳字的左边缘，供「右侧空白门槛」使用
+    // firstLeft：返回实际采纳段的第一个字左边缘，供「右侧空白门槛」使用
     {
         double fl = -1.0;
         TakeRightOfCursor(line, xs, 50.0, nullptr, nullptr, &fl);
@@ -255,6 +255,22 @@ static void TestSearch() {
     m4.maxResults = 200;
     m4.searchOffice = false;
     Check(RunSearch(m4).items.size() == 1, "AND: fullwidth/multiple spaces split too");
+
+    // OCR 常把「第4.1条 车站」的空格吃掉，关键词「条车站」也必须能命中
+    WriteUtf8(JoinPath(dir, L"space.txt"),
+              L"第4.1条 车站值班员应确认区间空闲。\n另一行没有空格。\n");
+    SearchRequest m5;
+    m5.keyword = L"条车站值班员";
+    m5.rootDir = dir;
+    m5.contextLevel = 0;
+    m5.maxResults = 200;
+    m5.searchOffice = false;
+    SearchOutcome m5o = RunSearch(m5);
+    Check(m5o.items.size() == 1, "CJK keyword ignores spaces in line");
+    if (!m5o.items.empty()) {
+        Check(m5o.items[0].hitStart == 4, "space-insensitive match starts at 条");
+        Check(m5o.items[0].hitLen == 7, "match span covers the skipped space");
+    }
 }
 
 int main() {
