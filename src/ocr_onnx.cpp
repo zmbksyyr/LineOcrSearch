@@ -3,6 +3,7 @@
 #include "../vendor/onnxruntime_c_api.h"
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 
 // ---------------- ORT 全局状态 ----------------
 
@@ -180,6 +181,9 @@ static void ToGray(const unsigned char* bgra, int w, int h, std::vector<unsigned
 
 struct LineSpan { int top = 0; int bottom = 0; };
 
+static void SplitTallSpan(const std::vector<int>& rowFg, int top, int bottom, int maxH,
+                          std::vector<LineSpan>& out);
+
 // 自动判断前景极性（深底浅字 / 浅底深字），再按行统计前景像素数找文字行
 static void FindTextLines(const std::vector<unsigned char>& gray, int w, int h,
                           std::vector<LineSpan>& spans, bool& darkText) {
@@ -228,6 +232,37 @@ static void FindTextLines(const std::vector<unsigned char>& gray, int w, int h,
         LineSpan s; s.top = start; s.bottom = h - 1;
         if (s.bottom - s.top >= 5) spans.push_back(s);
     }
+
+    // 行距很密时投影会把相邻几行粘成一块（高度超过单行文字的合理高度）。
+    // 在块内找前景最少的"谷底"行递归切开，让每一行都能单独送进模型。
+    const int kMaxLineH = 44;   // 32px 字号的行高约 42px
+    std::vector<LineSpan> split;
+    split.reserve(spans.size() + 4);
+    for (size_t i = 0; i < spans.size(); ++i)
+        SplitTallSpan(rowFg, spans[i].top, spans[i].bottom, kMaxLineH, split);
+    spans.swap(split);
+}
+
+// 把 (top,bottom) 高度超过 maxH 的块在前景最少的谷底行切开；切不动就整块保留
+static void SplitTallSpan(const std::vector<int>& rowFg, int top, int bottom, int maxH,
+                          std::vector<LineSpan>& out) {
+    int hgt = bottom - top + 1;
+    if (hgt <= maxH || bottom >= (int)rowFg.size()) {
+        if (hgt >= 5) { LineSpan s; s.top = top; s.bottom = bottom; out.push_back(s); }
+        return;
+    }
+    int best = -1, bestV = 1 << 30;
+    int lo = top + 10, hi = bottom - 10;
+    for (int y = lo; y <= hi; ++y) {
+        if (rowFg[y] < bestV) { bestV = rowFg[y]; best = y; }
+    }
+    // 谷底行自身可能带一点点笔画（逗号下伸等），两半各留至少 10px 才算切得动
+    if (best < 0 || best - top < 10 || bottom - best < 10) {
+        LineSpan s; s.top = top; s.bottom = bottom; out.push_back(s);
+        return;
+    }
+    SplitTallSpan(rowFg, top, best - 1, maxH, out);
+    SplitTallSpan(rowFg, best + 1, bottom, maxH, out);
 }
 
 // ---------------- 缩放 + 归一化 ----------------
@@ -308,53 +343,12 @@ static std::wstring CtcDecode(const float* data, int T, int C, int srcW,
 
 // ---------------- 对外识别 ----------------
 
-bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h, int mouseY,
-                      std::wstring& text, int* lineTop, int* lineBottom,
-                      std::vector<double>* charX) {
+// 对灰度图的 [top..bottom] 行（整幅宽度）跑一次模型，输出文字与每字 x 坐标
+static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
+                          int top, int bottom,
+                          std::wstring& text, std::vector<double>* charX) {
     text.clear();
     if (charX) charX->clear();
-    if (lineTop) *lineTop = 0;
-    if (lineBottom) *lineBottom = 0;
-    if (!g_sess || !bgra || w <= 0 || h <= 0) return false;
-
-    std::vector<unsigned char> gray;
-    ToGray(bgra, w, h, gray);
-
-    std::vector<LineSpan> spans;
-    bool darkText = true;
-    FindTextLines(gray, w, h, spans, darkText);
-    if (spans.empty()) return false;
-
-    // 选包含鼠标 Y 的行；落在空白处取最近的一行
-    int pick = -1;
-    int bestDist = 1 << 30;
-    for (size_t i = 0; i < spans.size(); ++i) {
-        if (mouseY >= spans[i].top && mouseY <= spans[i].bottom) { pick = (int)i; break; }
-        int d = (mouseY < spans[i].top) ? (spans[i].top - mouseY) : (mouseY - spans[i].bottom);
-        if (d < bestDist) { bestDist = d; pick = (int)i; }
-    }
-    if (pick < 0) return false;
-
-    int top = spans[pick].top;
-    int bottom = spans[pick].bottom;
-
-    // 行距很密时投影会把相邻几行粘成一块，这种情况按鼠标 Y 再切出一行，
-    // 避免把上下好几行一起送进模型导致识别结果串行。
-    int spanH = bottom - top + 1;
-    if (spanH > 44) {
-        int half = 22;
-        int t2 = mouseY - half;
-        int b2 = mouseY + half;
-        if (t2 < top) t2 = top;
-        if (b2 > bottom) b2 = bottom;
-        if (b2 - t2 + 1 >= 12) {
-            top = t2;
-            bottom = b2;
-        }
-    }
-
-    if (lineTop) *lineTop = top;
-    if (lineBottom) *lineBottom = bottom;
 
     int pad = 3;
     int y0 = top - pad; if (y0 < 0) y0 = 0;
@@ -415,4 +409,66 @@ bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h, int mouseY,
     text = result;
     if (charX && xs.size() == result.size()) charX->swap(xs);
     return !text.empty();
+}
+
+bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h, int mouseY,
+                      std::wstring& text, int* lineTop, int* lineBottom,
+                      std::vector<double>* charX) {
+    text.clear();
+    if (charX) charX->clear();
+    if (lineTop) *lineTop = 0;
+    if (lineBottom) *lineBottom = 0;
+    if (!g_sess || !bgra || w <= 0 || h <= 0) return false;
+
+    std::vector<unsigned char> gray;
+    ToGray(bgra, w, h, gray);
+
+    std::vector<LineSpan> spans;
+    bool darkText = true;
+    FindTextLines(gray, w, h, spans, darkText);
+    if (spans.empty()) return false;
+
+    // 候选行按「与鼠标 Y 的距离」排序（包含鼠标的行距离 0），
+    // 最多试 3 行：最近的行识别不出有效文字就换下一行，
+    // 避免一小块识别不出来的碎文字（图标、边角 UI）挡住真正的目标。
+    std::vector<std::pair<int, int> > cands;   // <distance, spanIndex>
+    cands.reserve(spans.size());
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const LineSpan& s = spans[i];
+        int d = (mouseY >= s.top && mouseY <= s.bottom)
+                    ? 0
+                    : (mouseY < s.top ? s.top - mouseY : mouseY - s.bottom);
+        cands.push_back(std::make_pair(d, (int)i));
+    }
+    if (cands.empty()) return false;
+    std::sort(cands.begin(), cands.end());
+    if (cands.size() > 3) cands.resize(3);
+
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        const LineSpan& s = spans[(size_t)cands[ci].second];
+
+        int top = s.top, bottom = s.bottom;
+        // 行距极密且切不开时仍可能很高，按鼠标 Y 切出一行，避免串行
+        if (bottom - top + 1 > 44) {
+            int t2 = mouseY - 22, b2 = mouseY + 22;
+            if (t2 < top) t2 = top;
+            if (b2 > bottom) b2 = bottom;
+            if (b2 - t2 + 1 >= 12) { top = t2; bottom = b2; }
+        }
+
+        std::wstring t;
+        std::vector<double> xs;
+        if (!RecognizeSpan(gray, w, h, top, bottom, t, &xs)) continue;
+        if (CountTextChars(CleanOcrText(t)) < 2) continue;
+
+        text = t;
+        if (charX) {
+            if (xs.size() == t.size()) charX->swap(xs);
+            else charX->clear();
+        }
+        if (lineTop) *lineTop = top;
+        if (lineBottom) *lineBottom = bottom;
+        return true;
+    }
+    return false;
 }

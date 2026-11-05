@@ -366,8 +366,48 @@ static void UpdateMouseStatus(POINT p) {
 }
 
 // 鼠标静止判定 -> 取词（自动模式先文字层、再图像层，取到的那一路才算数）
-// 截一条鼠标附近的带子认出「一行」：先从上下各 80px 找，找不到再扩到 150px
+// 截一条鼠标附近的带子认出「一行」：先从上下各 80px 找，找不到扩到 150px、300px
 // 输出 text / 每字像素 x（条带内坐标）/ mouseLocalX，像素缓冲用完清零
+
+// 把条带里本程序自己的窗口区域涂成背景色（条带灰度众数）：
+// 大条带会把旁边自己的状态栏框进来，离鼠标很近、总被当成"最近的一行"，
+// 识别结果还干扰真实目标。涂掉后投影和模型都看不到它。
+static void MaskOwnWindow(CapturedBgra& cap) {
+    if (!g_hwndMain) return;
+    RECT wr{};
+    if (!GetWindowRect(g_hwndMain, &wr)) return;
+    POINT cp{};
+    if (!GetCursorPos(&cp)) return;
+
+    // 条带在屏幕上的原点 = 光标 - 光标在条带内的位置
+    int bx = cp.x - cap.mouseLocalX;
+    int by = cp.y - cap.mouseLocalY;
+    int x0 = wr.left - bx;   if (x0 < 0) x0 = 0;
+    int y0 = wr.top - by;    if (y0 < 0) y0 = 0;
+    int x1 = wr.right - bx;  if (x1 > cap.w) x1 = cap.w;
+    int y1 = wr.bottom - by; if (y1 > cap.h) y1 = cap.h;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    // 背景色 = 全条带灰度众数（深色桌面上涂深色、浅色窗口上涂浅色，不破坏极性判定）
+    int hist[256] = {0};
+    for (size_t i = 0; i < cap.px.size(); i += 16) {        // 4 像素一采样，够用
+        unsigned b = cap.px[i], g = cap.px[i + 1], r = cap.px[i + 2];
+        hist[(r * 299 + g * 587 + b * 114) / 1000]++;
+    }
+    int mode = 0, best = 0;
+    for (int v = 0; v < 256; ++v) if (hist[v] > best) { best = hist[v]; mode = v; }
+
+    for (int y = y0; y < y1; ++y) {
+        unsigned char* row = &cap.px[(size_t)y * cap.w * 4];
+        for (int x = x0; x < x1; ++x) {
+            row[x * 4 + 0] = (unsigned char)mode;
+            row[x * 4 + 1] = (unsigned char)mode;
+            row[x * 4 + 2] = (unsigned char)mode;
+            row[x * 4 + 3] = 255;
+        }
+    }
+}
+
 static bool OcrLineAtCursor(std::wstring& text, std::vector<double>& xs,
                             int& mouseLocalX, std::wstring& fail) {
     text.clear();
@@ -380,10 +420,12 @@ static bool OcrLineAtCursor(std::wstring& text, std::vector<double>& xs,
         if (!OcrInit(err)) { g.caps.c2Model = false; fail = err; return false; }
     }
 
-    const int radii[2] = { 80, 150 };
-    for (int ri = 0; ri < 2; ++ri) {
+    const int radii[3] = { 80, 150, 300 };
+    for (int ri = 0; ri < 3; ++ri) {
         CapturedBgra cap;
         if (!CaptureBand(400, radii[ri], cap)) { fail = L"截屏失败"; continue; }
+
+        MaskOwnWindow(cap);
 
         std::wstring t;
         std::vector<double> v;
