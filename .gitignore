@@ -1,0 +1,26 @@
+# 构建产物
+dist/
+build/
+.deps/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.map
+
+# 打包输入（运行时库与模型随仓库分发，clone 后可直接构建）
+
+# 运行时数据目录（exe 旁边首次启动才生成，源码树里不该出现）
+LineOcrSearchData/
+LineOcrSearch/
+config/
+
+# 自测临时目录
+tests/tmp/
+
+# 工具与会话数据
+.workbuddy/
+*.log
+Thumbs.db
+desktop.ini
