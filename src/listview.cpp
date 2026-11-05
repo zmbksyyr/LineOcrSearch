@@ -156,6 +156,7 @@ static int DrawWrappedLine(HDC dc, int x, int y, const std::vector<Seg>& segs,
 
 // 缓存的折行前提：窗口宽度 + 结果条数。任一变化就重算每张卡片的高度。
 static int              g_wrapW = -1;
+static bool             g_resizePending = false;
 static unsigned         g_wrapSeq = 0xFFFFFFFFu;   // 结果换代也要重算（条数可能刚好相同）
 static std::vector<int> g_itemH;
 
@@ -176,6 +177,18 @@ static int MeasureItem(HDC dc, const ResultItem& it, int maxW) {
 static int ItemH(size_t i) {
     if (i >= g_itemH.size()) return kCardPad * 2 + g_lineH * 2 + kCardGap;
     return g_itemH[i];
+}
+
+void ListFlushPendingResize() {
+    if (!g_resizePending || !g_hwndList) return;
+    g_resizePending = false;
+    RecalcTotalHeight();
+    RECT rc{};
+    GetClientRect(g_hwndList, &rc);
+    int maxScroll = g.totalH - rc.bottom;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g.scrollY > maxScroll) g.scrollY = maxScroll;
+    InvalidateRect(g_hwndList, nullptr, TRUE);
 }
 
 void RecalcTotalHeight() {
@@ -604,8 +617,27 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
-            RecalcTotalHeight();
+            // 结果很多时，拖动窗口会重测每一条（6 行文本/条）。拖动期间只标记，
+            // 松开后再统一重测；结果少时直接算，避免程序化改尺寸后高度不更新。
+            if (g.outcome.items.size() <= 200) {
+                RecalcTotalHeight();
+                g_resizePending = false;
+            } else {
+                g_resizePending = true;
+            }
             InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            if (g_resizePending) {
+                g_resizePending = false;
+                RecalcTotalHeight();
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                int maxScroll = g.totalH - rc.bottom;
+                if (maxScroll < 0) maxScroll = 0;
+                if (g.scrollY > maxScroll) g.scrollY = maxScroll;
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
             return 0;
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wp);

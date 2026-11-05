@@ -79,6 +79,7 @@ static const int kMaxBacktrack = 12;
 static std::wstring g_pendingKeyword;
 static bool     g_pendingFromCapture = false;
 static bool     g_hasPendingSearch = false;
+static bool     g_inSizeMove = false;   // 用户正在拖动窗口边缘：列表重测延后
 
 // ---------------- 能力探测 ----------------
 
@@ -1033,8 +1034,16 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetStatus();
             return 0;
         }
+        case WM_ENTERSIZEMOVE:
+            g_inSizeMove = true;
+            return 0;
+        case WM_EXITSIZEMOVE:
+            g_inSizeMove = false;
+            ListFlushPendingResize();
+            return 0;
         case WM_SIZE:
             Layout(hwnd);
+            if (!g_inSizeMove) ListFlushPendingResize();
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_PAINT:
