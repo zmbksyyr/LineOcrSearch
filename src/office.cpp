@@ -316,160 +316,183 @@ struct ZipArchive {
 };
 
 // ======================= XML 文本抽取 =======================
+//
+// 全部按「指针 + 长度」扫描：不再为每个标签 substr，也不再为整份 xml 建 std::string。
+// 一个 10MB 的 document.xml 有几十万个标签，旧写法要上百万次小分配 + 一次 10MB 拷贝。
 
-// 去掉命名空间前缀：w:p -> p，x:c -> c
-static std::string StripNs(const std::string& name) {
-    size_t c = name.find(':');
-    return (c == std::string::npos) ? name : name.substr(c + 1);
+struct XmlTag {
+    const char* name = nullptr;
+    size_t nameLen = 0;
+    bool closing = false;
+    bool selfClosing = false;
+};
+
+// 解析 <...> 里的标签名（去掉命名空间前缀：w:p -> p）
+static XmlTag ParseTag(const char* lt, const char* gt) {
+    XmlTag t;
+    const char* p = lt + 1;
+    if (p < gt && *p == '/') { t.closing = true; ++p; }
+    const char* b = p;
+    while (p < gt && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && *p != '/' && *p != '>') ++p;
+    const char* nb = b;
+    for (const char* q = b; q < p; ++q) {
+        if (*q == ':') nb = q + 1;
+    }
+    t.name = nb;
+    t.nameLen = (size_t)(p - nb);
+    t.selfClosing = (gt > lt + 1) && (*(gt - 1) == '/');
+    return t;
 }
 
-static void AppendUtf8AsWide(std::wstring& out, const std::string& s) {
-    if (s.empty()) return;
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return;
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
-    out += w;
+template <size_t N>
+static bool NameIs(const XmlTag& t, const char (&lit)[N]) {
+    return t.nameLen == N - 1 && memcmp(t.name, lit, N - 1) == 0;
 }
 
-static void AppendXmlTextRaw(std::wstring& out, const std::string& s) {
-    // 处理常见实体
+static void AppendUtf8Range(std::wstring& out, const char* s, size_t n) {
+    if (!s || n == 0) return;
+    int need = MultiByteToWideChar(CP_UTF8, 0, s, (int)n, nullptr, 0);
+    if (need <= 0) return;
+    size_t old = out.size();
+    out.resize(old + (size_t)need);
+    MultiByteToWideChar(CP_UTF8, 0, s, (int)n, &out[old], need);
+}
+
+static void AppendXmlTextRaw(std::wstring& out, const char* s, size_t n) {
+    if (!s || n == 0) return;
+    // 绝大多数文本片段没有实体：直接转，省一次中间拷贝
+    if (!memchr(s, '&', n)) {
+        AppendUtf8Range(out, s, n);
+        return;
+    }
     std::string buf;
-    buf.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
+    buf.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
         if (s[i] == '&') {
-            if (s.compare(i, 5, "&amp;") == 0) { buf += '&'; i += 4; continue; }
-            if (s.compare(i, 4, "&lt;") == 0)  { buf += '<'; i += 3; continue; }
-            if (s.compare(i, 4, "&gt;") == 0)  { buf += '>'; i += 3; continue; }
-            if (s.compare(i, 6, "&quot;") == 0){ buf += '"'; i += 5; continue; }
-            if (s.compare(i, 6, "&apos;") == 0){ buf += '\''; i += 5; continue; }
-            if (s.compare(i, 5, "&#10;") == 0) { buf += '\n'; i += 4; continue; }
+            size_t left = n - i;
+            if (left >= 5 && memcmp(s + i, "&amp;", 5) == 0) { buf += '&'; i += 4; continue; }
+            if (left >= 4 && memcmp(s + i, "&lt;", 4) == 0)  { buf += '<'; i += 3; continue; }
+            if (left >= 4 && memcmp(s + i, "&gt;", 4) == 0)  { buf += '>'; i += 3; continue; }
+            if (left >= 6 && memcmp(s + i, "&quot;", 6) == 0){ buf += '"'; i += 5; continue; }
+            if (left >= 6 && memcmp(s + i, "&apos;", 6) == 0){ buf += '\''; i += 5; continue; }
+            if (left >= 5 && memcmp(s + i, "&#10;", 5) == 0) { buf += '\n'; i += 4; continue; }
         }
         buf += s[i];
     }
-    AppendUtf8AsWide(out, buf);
+    AppendUtf8Range(out, buf.data(), buf.size());
+}
+
+// 在标签文本 [b,e) 里找属性值：支持 t="s" / t='s' / t = "s"，属性顺序任意。
+// 旧写法硬匹配字面量 t="s"，换单引号或加空格就判不出共享字符串，
+// 结果把共享字符串索引当数字输出（本该是「闭塞」，界面上显示「37」）。
+static bool FindAttr(const char* b, const char* e, const char* attr, size_t attrLen,
+                     const char** val, size_t* valLen) {
+    auto isWs = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const char* p = b;
+    while (p < e) {
+        p = (const char*)memchr(p, attr[0], (size_t)(e - p));
+        if (!p || (size_t)(e - p) < attrLen) return false;
+        bool okL = (p == b) || isWs(p[-1]);
+        bool okR = (p + attrLen < e) && (isWs(p[attrLen]) || p[attrLen] == '=');
+        if (okL && okR && memcmp(p, attr, attrLen) == 0) {
+            const char* q = p + attrLen;
+            while (q < e && isWs(*q)) ++q;
+            if (q >= e || *q != '=') return false;
+            ++q;
+            while (q < e && isWs(*q)) ++q;
+            if (q >= e || (*q != '"' && *q != '\'')) return false;
+            char quote = *q++;
+            const char* close = (const char*)memchr(q, quote, (size_t)(e - q));
+            if (!close) return false;
+            *val = q;
+            *valLen = (size_t)(close - q);
+            return true;
+        }
+        ++p;
+    }
+    return false;
 }
 
 // docx：按 <w:p> 分段，取 <w:t> 文本
 // 单元格 <w:tc> 结束补一个 \t：否则一行三列会粘成「闭塞区段办理」，
-// 搜「区段办」会命中原文里根本没有的词
-// <w:delText>（修订模式下被删掉的文字）与 <w:t> 一样收进正文：
-// 用户想搜"修订前的说法"时要搜得到
-static void ExtractWordXml(const std::string& xml, std::wstring& out) {
-    size_t p = 0;
+// 搜「区段办」会命中原文里根本没有的词。
+// <w:delText>（修订模式下被删掉的文字）与 <w:t> 一样收进正文。
+static void ExtractWordXml(const char* xml, size_t n, std::wstring& out) {
+    const char* p = xml;
+    const char* end = xml + n;
     bool inT = false;
-    while (p < xml.size()) {
-        size_t lt = xml.find('<', p);
-        if (lt == std::string::npos) {
-            if (inT) AppendXmlTextRaw(out, xml.substr(p));
+    while (p < end) {
+        const char* lt = (const char*)memchr(p, '<', (size_t)(end - p));
+        if (!lt) {
+            if (inT) AppendXmlTextRaw(out, p, (size_t)(end - p));
             break;
         }
-        if (inT) AppendXmlTextRaw(out, xml.substr(p, lt - p));
+        if (inT) AppendXmlTextRaw(out, p, (size_t)(lt - p));
 
-        size_t gt = xml.find('>', lt);
-        if (gt == std::string::npos) break;
-        std::string tag = xml.substr(lt + 1, gt - lt - 1);
+        const char* gt = (const char*)memchr(lt, '>', (size_t)(end - lt));
+        if (!gt) break;
+        const XmlTag t = ParseTag(lt, gt);
 
-        bool closing = !tag.empty() && tag[0] == '/';
-        std::string name = closing ? tag.substr(1) : tag;
-        size_t sp = name.find_first_of(" \t\r\n/");
-        if (sp != std::string::npos) name = name.substr(0, sp);
-        name = StripNs(name);
-
-        if (name == "t" || name == "delText") {
-            inT = !closing;
-        } else if (name == "p") {
+        if (NameIs(t, "t") || NameIs(t, "delText")) {
+            inT = !t.closing;
+        } else if (NameIs(t, "p")) {
             // 只在 </w:p> 收尾：开标签也加的话，单元格首段会在 \t 后面再插一个 \n
-            if (closing) {
+            if (t.closing) {
                 if (!out.empty() && out.back() == L'\t') out.pop_back();  // 行尾不留空列
                 if (!out.empty() && out.back() != L'\n') out += L'\n';
             }
-        } else if (name == "tc") {
+        } else if (NameIs(t, "tc")) {
             // 单元格内部的段落已经收过尾，把那个 \n 改成 \t，整行才算一行
-            if (closing && !out.empty()) {
+            if (t.closing && !out.empty()) {
                 if (out.back() == L'\n') out.back() = L'\t';
                 else if (out.back() != L'\t') out += L'\t';
             }
-        } else if (name == "tab") {
+        } else if (NameIs(t, "tab")) {
             out += L'\t';
-        } else if (name == "tr") {
+        } else if (NameIs(t, "tr")) {
             // 一行结束：把最后一个列分隔符换成换行，否则表尾会和下一段粘成一行
-            if (closing && !out.empty() && out.back() == L'\t') out.back() = L'\n';
-        } else if (name == "br" || name == "cr") {
+            if (t.closing && !out.empty() && out.back() == L'\t') out.back() = L'\n';
+        } else if (NameIs(t, "br") || NameIs(t, "cr")) {
             out += L'\n';
         }
         p = gt + 1;
     }
 }
 
-// xlsx：sharedStrings 收集 <si> 文本；sheet 按 <row> 换行，按 <c> 取 <v>
-static void ExtractSharedStrings(const std::string& xml, std::vector<std::wstring>& out) {
-    size_t p = 0;
+// xlsx：sharedStrings 收集 <si> 文本
+static void ExtractSharedStrings(const char* xml, size_t n, std::vector<std::wstring>& out) {
+    const char* p = xml;
+    const char* end = xml + n;
     std::wstring cur;
     bool inSi = false, inT = false;
-    while (p < xml.size()) {
-        size_t lt = xml.find('<', p);
-        if (lt == std::string::npos) break;
-        if (inT) AppendXmlTextRaw(cur, xml.substr(p, lt - p));
+    while (p < end) {
+        const char* lt = (const char*)memchr(p, '<', (size_t)(end - p));
+        if (!lt) break;
+        if (inT) AppendXmlTextRaw(cur, p, (size_t)(lt - p));
 
-        size_t gt = xml.find('>', lt);
-        if (gt == std::string::npos) break;
-        std::string tag = xml.substr(lt + 1, gt - lt - 1);
-        bool closing = !tag.empty() && tag[0] == '/';
-        std::string name = closing ? tag.substr(1) : tag;
-        size_t sp = name.find_first_of(" \t\r\n/");
-        if (sp != std::string::npos) name = name.substr(0, sp);
-        name = StripNs(name);
+        const char* gt = (const char*)memchr(lt, '>', (size_t)(end - lt));
+        if (!gt) break;
+        const XmlTag t = ParseTag(lt, gt);
 
-        if (name == "si") {
-            if (!closing) { inSi = true; cur.clear(); }
+        if (NameIs(t, "si")) {
+            if (!t.closing) { inSi = true; cur.clear(); }
             else if (inSi) { out.push_back(cur); inSi = false; }
-        } else if (name == "t") {
-            inT = !closing;
+        } else if (NameIs(t, "t")) {
+            inT = !t.closing;
         }
         p = gt + 1;
     }
 }
 
-// 从标签文本里取属性值：支持 t="s" / t='s' / t = "s"，属性顺序任意。
-// 之前用 tag.find("t=\"s\"") 硬匹配字面量，换单引号或加空格就判不出共享字符串，
-// 结果把共享字符串索引当数字输出（本该是「闭塞」，界面上显示「37」）。
-static bool XmlAttr(const std::string& tag, const char* attr, std::string& out) {
-    auto isWs = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
-    const size_t n = std::string(attr).size();
-    size_t p = 0;
-    while ((p = tag.find(attr, p)) != std::string::npos) {
-        bool okL = (p == 0) || isWs(tag[p - 1]);
-        size_t q = p + n;
-        bool okR = (q < tag.size()) && (isWs(tag[q]) || tag[q] == '=');
-        if (okL && okR) {
-            while (q < tag.size() && isWs(tag[q])) ++q;
-            if (q < tag.size() && tag[q] == '=') {
-                ++q;
-                while (q < tag.size() && isWs(tag[q])) ++q;
-                if (q < tag.size() && (tag[q] == '"' || tag[q] == '\'')) {
-                    char quote = tag[q++];
-                    size_t e = tag.find(quote, q);
-                    if (e == std::string::npos) return false;
-                    out.assign(tag, q, e - q);
-                    return true;
-                }
-            }
-        }
-        p += 1;
-    }
-    return false;
-}
-
-static void ExtractSheetXml(const std::string& xml, const std::vector<std::wstring>& shared,
+// xlsx：工作表按 <row> 换行，按 <c> 取 <v>（共享字符串查表）
+static void ExtractSheetXml(const char* xml, size_t n, const std::vector<std::wstring>& shared,
                             std::wstring& out) {
-    size_t p = 0;
-    bool inV = false, inIsT = false;
+    const char* p = xml;
+    const char* end = xml + n;
     int cellTypeShared = 0;
     std::string cellText;
     std::wstring inlineText;
     std::wstring rowLine;
-    int colCount = 0;
 
     auto flushCell = [&]() {
         std::wstring val;
@@ -479,7 +502,7 @@ static void ExtractSheetXml(const std::string& xml, const std::vector<std::wstri
         } else if (!inlineText.empty()) {
             val = inlineText;
         } else if (!cellText.empty()) {
-            AppendUtf8AsWide(val, cellText);  // 数字 / 布尔 / 公式结果
+            AppendUtf8Range(val, cellText.data(), cellText.size());  // 数字 / 布尔 / 公式结果
         }
         if (!val.empty()) {
             if (!rowLine.empty()) rowLine += L'\t';
@@ -490,59 +513,41 @@ static void ExtractSheetXml(const std::string& xml, const std::vector<std::wstri
         inlineText.clear();
     };
 
-    while (p < xml.size()) {
-        size_t lt = xml.find('<', p);
-        if (lt == std::string::npos) break;
-        size_t gt = xml.find('>', lt);
-        if (gt == std::string::npos) break;
+    while (p < end) {
+        const char* lt = (const char*)memchr(p, '<', (size_t)(end - p));
+        if (!lt) break;
+        const char* gt = (const char*)memchr(lt, '>', (size_t)(end - lt));
+        if (!gt) break;
 
-        std::string tag = xml.substr(lt + 1, gt - lt - 1);
-        bool closing = !tag.empty() && tag[0] == '/';
-        std::string body = closing ? tag.substr(1) : tag;
-        size_t sp = body.find_first_of(" \t\r\n/");
-        std::string name = (sp == std::string::npos) ? body : body.substr(0, sp);
-        name = StripNs(name);
+        const XmlTag t = ParseTag(lt, gt);
+        const char* textB = gt + 1;
+        const char* nextLt = (const char*)memchr(textB, '<', (size_t)(end - textB));
 
-        if (name == "c") {
-            if (!closing) {
-                std::string tAttr;
-                cellTypeShared = (XmlAttr(tag, "t", tAttr) && tAttr == "s") ? 1 : 0;
+        if (NameIs(t, "c")) {
+            if (!t.closing) {
+                const char* v = nullptr;
+                size_t vn = 0;
+                cellTypeShared = (FindAttr(lt + 1, gt, "t", 1, &v, &vn) && vn == 1 && *v == 's') ? 1 : 0;
                 cellText.clear();
                 inlineText.clear();
             } else {
                 flushCell();
-                ++colCount;
             }
-        } else if (name == "v") {
-            inV = !closing;
-            if (!closing) cellText.clear();
-        } else if (name == "t" && closing) {
-            inIsT = false;
-        } else if (name == "row") {
-            if (closing) {
+        } else if (NameIs(t, "v")) {
+            if (!t.closing && nextLt) cellText.append(textB, (size_t)(nextLt - textB));
+        } else if (NameIs(t, "t")) {
+            if (!t.closing && nextLt) AppendXmlTextRaw(inlineText, textB, (size_t)(nextLt - textB));
+        } else if (NameIs(t, "row")) {
+            if (t.closing) {
                 if (!rowLine.empty()) {
                     out += rowLine;
                     out += L"\n";
                 }
                 rowLine.clear();
-                colCount = 0;
             }
         }
 
-        // 捕获节点文字
-        size_t nextLt = xml.find('<', gt + 1);
-        std::string inner = (nextLt == std::string::npos)
-                            ? xml.substr(gt + 1)
-                            : xml.substr(gt + 1, nextLt - gt - 1);
-        if (name == "v") {
-            if (!closing) cellText += inner;
-        } else if (name == "t") {
-            if (!closing) {
-                AppendXmlTextRaw(inlineText, inner);
-                inIsT = true;
-            }
-        }
-        if (nextLt == std::string::npos) break;
+        if (!nextLt) break;
         p = nextLt;
     }
     if (!rowLine.empty()) { out += rowLine; out += L"\n"; }
@@ -599,15 +604,13 @@ bool ExtractOfficeText(const std::wstring& path, std::wstring& outText) {
         const ZipEntry* e = zip.Find("word/document.xml");
         if (!e) return false;
         if (!zip.Read(e, buf)) return false;
-        std::string xml((const char*)buf.data(), buf.size());
-        ExtractWordXml(xml, text);
+        ExtractWordXml((const char*)buf.data(), buf.size(), text);
     } else if (ext == L".xlsx" || ext == L".xlsm") {
         // 共享字符串
         std::vector<std::wstring> shared;
         if (const ZipEntry* e = zip.Find("xl/sharedStrings.xml")) {
             if (zip.Read(e, buf)) {
-                std::string xml((const char*)buf.data(), buf.size());
-                ExtractSharedStrings(xml, shared);
+                ExtractSharedStrings((const char*)buf.data(), buf.size(), shared);
             }
         }
         // 依次拼接工作表
@@ -616,8 +619,7 @@ bool ExtractOfficeText(const std::wstring& path, std::wstring& outText) {
             if (nm.compare(0, 14, "xl/worksheets/") != 0) continue;
             if (nm.size() < 4 || nm.compare(nm.size() - 4, 4, ".xml") != 0) continue;
             if (!zip.Read(&zip.entries[i], buf)) continue;
-            std::string xml((const char*)buf.data(), buf.size());
-            ExtractSheetXml(xml, shared, text);
+            ExtractSheetXml((const char*)buf.data(), buf.size(), shared, text);
             text += L"\n";
         }
     } else {
