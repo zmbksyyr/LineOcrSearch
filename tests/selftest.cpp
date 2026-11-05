@@ -116,6 +116,19 @@ static void TestTakeRight() {
     Check(TakeRightOfCursor(L"·【应收账款】·", std::vector<double>(), 0.0) == L"应收账款",
           "no positions -> trim both ends only");
 
+    // firstLeft：第一个被采纳字的左边缘，供「右侧空白门槛」使用
+    {
+        double fl = -1.0;
+        TakeRightOfCursor(line, xs, 50.0, nullptr, nullptr, &fl);
+        Check(fl >= 30.0 && fl <= 50.0, "firstLeft near the char under cursor");
+        TakeRightOfCursor(line, xs, 150.0, nullptr, nullptr, &fl);
+        Check(fl >= 150.0 && fl <= 170.0, "firstLeft near next char after comma");
+        TakeRightOfCursor(L"纯文字", std::vector<double>(), 0.0, nullptr, nullptr, &fl);
+        Check(fl < 0.0, "no positions -> firstLeft unset");
+        TakeRightOfCursor(line, xs, 9000.0, nullptr, nullptr, &fl);
+        Check(fl < 0.0, "nothing right of cursor -> firstLeft unset");
+    }
+
     printf("-- TextSimilarity --\n");
     Check(TextSimilarity(L"状态栏", L"状态栏") > 0.999, "identical -> 1.0");
     Check(TextSimilarity(L"图标", L"状态栏") < 0.1, "unrelated -> near 0");

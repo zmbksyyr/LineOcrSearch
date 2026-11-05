@@ -96,8 +96,8 @@ int main() {
         std::vector<double> xs;
         int lt = 0, lb = 0;
         DWORD t0 = GetTickCount();
-        bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h, cap.mouseLocalY,
-                                   text, &lt, &lb, &xs);
+        bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h, cap.mouseLocalX,
+                                   cap.mouseLocalY, text, &lt, &lb, &xs);
         DWORD dt = GetTickCount() - t0;
 
         printf("\n[probe %d] clientX=%d mouseLocalX=%d  ok=%d  %lums\n",

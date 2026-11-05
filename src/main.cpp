@@ -432,15 +432,28 @@ static bool OcrLineAtCursor(std::wstring& text, std::vector<double>& xs,
         std::wstring t;
         std::vector<double> v;
         int lt = 0, lb = 0;
+        int reject = 0;
         bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h,
                                    cap.mouseLocalX, cap.mouseLocalY,
-                                   t, &lt, &lb, &v);
+                                   t, &lt, &lb, &v, &reject);
         int mx = cap.mouseLocalX;
         WipeBytes(cap.px);
 
-        if (!ok) { fail = L"图片里没找到文字行"; continue; }
-        if (CountTextChars(TakeRightOfCursor(t, v, (double)mx)) < 2) {
+        if (!ok) {
+            fail = (reject == 1) ? L"笔尖右侧是空白" : L"图片里没找到文字行";
+            continue;
+        }
+        size_t ob = 0, oe = 0;
+        double firstLeft = -1.0;
+        std::wstring seg = (v.size() == t.size())
+            ? TakeRightOfCursor(t, v, (double)mx, &ob, &oe, &firstLeft)
+            : TakeRightOfCursor(t, std::vector<double>(), 0.0);
+        if (CountTextChars(seg) < 2) {
             fail = L"笔尖右边没认出文字";
+            continue;
+        }
+        if (firstLeft >= 0 && firstLeft - (double)mx > (double)kMaxRightGap) {
+            fail = L"笔尖右侧是空白";
             continue;
         }
 
@@ -477,10 +490,12 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
         RECT rc{};
         std::vector<double> xs;
         if (CaptureNativeEditLine(t, s2, &rc, &xs)) {
+            double fl = -1.0;
             std::wstring cand = (xs.size() == t.size())
-                ? TakeRightOfCursor(t, xs, (double)p.x)
+                ? TakeRightOfCursor(t, xs, (double)p.x, nullptr, nullptr, &fl)
                 : TakeRightOfCursor(t, std::vector<double>(), 0.0);
-            if (CountTextChars(cand) >= 2) {
+            bool tooFar = (fl >= 0 && fl - (double)p.x > (double)kMaxRightGap);
+            if (CountTextChars(cand) >= 2 && !tooFar) {
                 raw = t;
                 src = s2;
                 charX = xs;
@@ -507,9 +522,12 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
 
         std::wstring uiaSeg;
         if (uiaOk) {
+            double ufl = -1.0;
             uiaSeg = (uiaX.size() == uiaLine.size())
-                         ? TakeRightOfCursor(uiaLine, uiaX, (double)p.x)
+                         ? TakeRightOfCursor(uiaLine, uiaX, (double)p.x, nullptr, nullptr, &ufl)
                          : TakeRightOfCursor(uiaLine, std::vector<double>(), 0.0);
+            // 与图片同一条门槛：UIA 给的元素整体在笔尖远处空白那边时不要
+            if (ufl >= 0 && ufl - (double)p.x > (double)kMaxRightGap) uiaSeg.clear();
         }
 
         if (!ocrSeg.empty() && !uiaSeg.empty()) {
@@ -567,10 +585,12 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
         RECT rc{};
         std::vector<double> xs;
         if (CaptureTextLayer(p, t, s2, &rc, &xs)) {
+            double fl = -1.0;
             std::wstring cand = (xs.size() == t.size())
-                ? TakeRightOfCursor(t, xs, (double)p.x)
+                ? TakeRightOfCursor(t, xs, (double)p.x, nullptr, nullptr, &fl)
                 : TakeRightOfCursor(t, std::vector<double>(), 0.0);
-            if (CountTextChars(cand) >= 2) {
+            bool tooFar = (fl >= 0 && fl - (double)p.x > (double)kMaxRightGap);
+            if (CountTextChars(cand) >= 2 && !tooFar) {
                 raw = t;
                 src = s2;
                 charX = xs;

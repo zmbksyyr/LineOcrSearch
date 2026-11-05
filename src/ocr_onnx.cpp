@@ -414,11 +414,12 @@ static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
 bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
                       int mouseX, int mouseY,
                       std::wstring& text, int* lineTop, int* lineBottom,
-                      std::vector<double>* charX) {
+                      std::vector<double>* charX, int* reject) {
     text.clear();
     if (charX) charX->clear();
     if (lineTop) *lineTop = 0;
     if (lineBottom) *lineBottom = 0;
+    if (reject) *reject = 0;
     if (!g_sess || !bgra || w <= 0 || h <= 0) return false;
 
     std::vector<unsigned char> gray;
@@ -428,6 +429,7 @@ bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
     bool darkText = true;
     FindTextLines(gray, w, h, spans, darkText);
     if (spans.empty()) return false;
+    if (reject) *reject = 1;   // 有行；后面每一行过不了门槛都会保持这个值
 
     // 候选行按「与鼠标 Y 的距离」排序（包含鼠标的行距离 0），
     // 最多试 3 行：最近的行识别不出有效文字就换下一行，
@@ -464,10 +466,15 @@ bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
 
         // 笔尖是「从这里开始」的锚点：这一行在笔尖右边必须真的还有字。
         // 没有就说明笔尖落在行尾空白或别的栏里，换下一行，不硬凑。
+        size_t ob = 0, oe = 0;
+        double firstLeft = -1.0;
         std::wstring seg = (xs.size() == t.size())
-                               ? TakeRightOfCursor(t, xs, (double)mouseX)
+                               ? TakeRightOfCursor(t, xs, (double)mouseX, &ob, &oe, &firstLeft)
                                : TakeRightOfCursor(t, std::vector<double>(), 0.0);
         if (CountTextChars(seg) < 2) continue;
+        // 笔尖右侧空白门槛：第一个字离笔尖太远（隔着一整块空白 / 别的栏）就不取。
+        // 桌面空白处实测：同高度的 WorkBuddy 文字离笔尖 699px，全被这一条拦下。
+        if (firstLeft >= 0 && firstLeft - (double)mouseX > (double)kMaxRightGap) continue;
 
         text = t;
         if (charX) {

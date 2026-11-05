@@ -239,7 +239,9 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
                             // 返回的却是侧栏「空间 (0)」「暂无任务」；任务管理器的「图标 / CPU」同理。
                             bool coversY = (pt.y >= rc.top && pt.y <= rc.bottom);
                             bool atRight = (rc.right >= pt.x - 24);
-                            if (coversY && atRight && hgt > 0 && hgt <= 120 && wid <= 2000) {
+                            // 左边也不能太远：整块空白那头的元素（别的栏、别的窗口）不要
+                            bool notFarRight = (rc.left <= pt.x + kMaxRightGap);
+                            if (coversY && atRight && notFarRight && hgt > 0 && hgt <= 120 && wid <= 2000) {
                                 BSTR nm = nullptr;
                                 if (SUCCEEDED(c->get_CurrentName(&nm)) && nm) {
                                     std::wstring s = TakeBstr(nm);
@@ -384,11 +386,30 @@ static bool TryMsaa(POINT pt, std::wstring& out, std::wstring& source, RECT* out
     if (FAILED(AccessibleObjectFromPoint(pt, &acc, &varChild)) || !acc) return false;
 
     RECT accRect{};
+    bool haveRect = false;
     {
         long l = 0, t = 0, w = 0, h = 0;
         if (SUCCEEDED(acc->accLocation(&l, &t, &w, &h, varChild))) {
             accRect.left = l; accRect.top = t;
             accRect.right = l + w; accRect.bottom = t + h;
+            haveRect = true;
+        }
+    }
+
+    // 几何校验：AccessibleObjectFromPoint 经常返回「容器」而不是文字本身——
+    // 桌面空白处返回整个桌面对象（名字就叫「桌面」，rect 是全屏），
+    // Electron 程序返回 Chrome Legacy Window（rect 是整个窗口）。
+    // 只有 rect 像一行文字、且落在笔尖邻域时才采信。
+    if (haveRect) {
+        long wid = accRect.right - accRect.left;
+        long hgt = accRect.bottom - accRect.top;
+        bool lineLike = (wid > 0 && hgt > 0 && wid <= 2000 && hgt <= 200);
+        bool coversY = (pt.y >= accRect.top - 8 && pt.y <= accRect.bottom + 8);
+        bool nearX = (accRect.right >= pt.x - 24 &&
+                      accRect.left <= pt.x + kMaxRightGap);
+        if (!lineLike || !coversY || !nearX) {
+            acc->Release();
+            return false;
         }
     }
 

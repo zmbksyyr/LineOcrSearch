@@ -169,13 +169,16 @@ static bool IsUnitSuffix(wchar_t c) {
 //   3) 两端去噪：空白 / 标点 / 符号 / 行首编号与日期前缀；中间原样保留
 std::wstring TakeRightOfCursor(const std::wstring& raw,
                                const std::vector<double>& charX, double mouseX,
-                               size_t* outBegin, size_t* outEnd) {
+                               size_t* outBegin, size_t* outEnd,
+                               double* firstLeft) {
     if (outBegin) *outBegin = 0;
     if (outEnd) *outEnd = 0;
+    if (firstLeft) *firstLeft = -1.0;
     if (raw.empty()) return std::wstring();
 
     size_t i0 = 0;
-    if (charX.size() == raw.size()) {
+    bool haveX = (charX.size() == raw.size());
+    if (haveX) {
         i0 = raw.size();
         for (size_t i = 0; i < raw.size(); ++i) {
             if (!IsHardText(raw[i])) continue;      // 标点不参与「起点」判定
@@ -211,6 +214,20 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     if (CountTextChars(out) < 1) return std::wstring();
     if (outBegin) *outBegin = i0 + b;
     if (outEnd) *outEnd = i0 + e;
+    if (haveX && firstLeft) {
+        // 第一个被采纳字符的左边缘：与相邻字符中心的中点近似
+        size_t i = i0 + b;
+        double half;
+        if (i + 1 < raw.size() && charX[i + 1] > charX[i]) {
+            half = (charX[i + 1] - charX[i]) * 0.5;
+        } else if (i > 0 && charX[i] > charX[i - 1]) {
+            half = (charX[i] - charX[i - 1]) * 0.5;
+        } else {
+            half = 8.0;
+        }
+        if (half < 2.0) half = 8.0;
+        *firstLeft = charX[i] - half;
+    }
     return out;
 }
 

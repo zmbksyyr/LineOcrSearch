@@ -115,9 +115,16 @@ std::wstring CleanOcrTextByX(const std::wstring& raw,
 //   3) 两端去噪（空白 / 标点 / 符号 / 开头编号），中间原样保留
 // 认不出有效文字时返回空串，由调用方决定是否回退。
 // outBegin/outEnd（可选）返回这段在 raw 里的下标区间，便于就地替换文字而保留坐标。
+// firstLeft（可选）返回这段第一个字的左边缘（与 mouseX 同一坐标系）；
+//   没有坐标信息时不写。调用方用它判断「笔尖右侧是不是一片空白」。
 std::wstring TakeRightOfCursor(const std::wstring& raw,
                                const std::vector<double>& charX, double mouseX,
-                               size_t* outBegin = nullptr, size_t* outEnd = nullptr);
+                               size_t* outBegin = nullptr, size_t* outEnd = nullptr,
+                               double* firstLeft = nullptr);
+
+// 笔尖右侧空白门槛：第一个字离笔尖超过这个距离就算「右侧是空白」，
+// 不再把远处的文字（别的栏、别的窗口）抓进来。桌面上离 WorkBuddy 几百像素的实测依据。
+const int kMaxRightGap = 150;
 // 两段文字的字符重合度 0..1（字符频次交集 / 较长者长度）。
 // 用来判断 UIA 与图片认的是不是同一句：差距大就以图片为准。
 double TextSimilarity(const std::wstring& a, const std::wstring& b);
@@ -187,10 +194,13 @@ void        OcrShutdown();
 bool        OcrReady();
 // mouseX / mouseY 为光标在条带内的坐标：
 //   Y 决定「第几行」，X 决定「这一行在笔尖右侧有没有字」——右侧整段空白的行不参与候选。
+// reject（可选）：0 = 条带里压根没有文字行；1 = 有行，但都过不了锚点门槛
+//   （笔尖右边没字 / 右侧空白太远），用来给状态栏更准的提示。
 bool        OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
                              int mouseX, int mouseY,
                              std::wstring& text, int* lineTop, int* lineBottom,
-                             std::vector<double>* charX = nullptr);
+                             std::vector<double>* charX = nullptr,
+                             int* reject = nullptr);
 std::wstring OcrEngineInfo();
 
 // ---- 对齐：把 OCR 认出来的一行对到 UIA 全文的对应片段 ----
