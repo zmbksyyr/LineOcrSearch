@@ -83,9 +83,11 @@ static void TestClean() {
 
 static void TestSearch() {
     printf("-- RunSearch --\n");
-    // 固定相对当前工作目录，避免测试因 exe 位置不同而失效
-    std::wstring dir = L"tests\\tmp";
+    // 固定相对当前工作目录，避免测试因 exe 位置不同而失效。
+    // 用独立子目录：tests\tmp 下还会放临时探针/截图，混在一起会污染命中数。
+    std::wstring dir = L"tests\\tmp\\selftest_search";
     CreateDirectoryW(L"tests", nullptr);
+    CreateDirectoryW(L"tests\\tmp", nullptr);
     CreateDirectoryW(dir.c_str(), nullptr);
 
     WriteUtf8(JoinPath(dir, L"a.txt"),

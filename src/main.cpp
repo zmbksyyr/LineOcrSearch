@@ -42,6 +42,9 @@ static const int kSideMargin = 14;
 
 struct SearchResultMsg {
     unsigned seq;
+    // 请求在主线程填好再交给工作线程：线程里一律不碰 g.settings
+    // （主线程可能正在保存设置/拖入新文件夹，std::wstring 赋值不是原子的）
+    SearchRequest req;
     SearchOutcome outcome;
 };
 
@@ -65,6 +68,7 @@ static POINT    g_lastPt{};
 static DWORD    g_stillSince = 0;
 static DWORD    g_lastAttempt = 0;
 static bool     g_fired = false;
+static int      g_attemptsAtPoint = 0;   // 同一个静止点位已经取过几次（失败就放弃）
 static std::wstring g_lastCaptured;
 static bool     g_autoBacktrack = false;
 static int      g_backtrackTries = 0;
@@ -112,7 +116,9 @@ void SetLeftStatus(const std::wstring& s) {
 static void SetStatus() {
     const int shown = (int)g.outcome.items.size();
     const int total = g.outcome.totalHits > 0 ? g.outcome.totalHits : shown;
-    g_statusRight = L"命中 " + std::to_wstring(total) + L" 条";
+    // 撞到收集上限时 total 只是「至少这么多」，加个 ≥ 避免被当成精确次数
+    g_statusRight = std::wstring(L"命中 ") + (g.outcome.truncated ? L"≥ " : L"") +
+                    std::to_wstring(total) + L" 条";
     if (g.outcome.totalFiles > 0) {
         g_statusRight += L" · " + std::to_wstring(g.outcome.totalFiles) + L" 个文件";
     }
@@ -159,14 +165,7 @@ static std::wstring TrimW2(const std::wstring& s) {
 
 static DWORD WINAPI SearchThreadProc(LPVOID param) {
     SearchResultMsg* msg = (SearchResultMsg*)param;
-    SearchRequest req;
-    req.keyword      = msg->outcome.keyword;
-    req.rootDir      = g.settings.rootDir;
-    req.searchOffice = g.settings.searchOffice;
-    req.contextLevel = g.settings.contextLevel;
-    req.maxResults   = g.settings.maxResults;
-
-    SearchOutcome res = RunSearch(req);
+    SearchOutcome res = RunSearch(msg->req);   // req 是主线程填好的快照
     msg->outcome = std::move(res);
     PostMessageW(g_hwndMain, WM_APP_RESULTS, 0, (LPARAM)msg);
     return 0;
@@ -242,9 +241,17 @@ static void EditSetUsed(size_t used) {
     }
 }
 
+static void CycleFocus(bool back);   // 定义在下面：Tab 键共用同一条焦点链
+
 // 单行输入：回车直接搜索，不让插换行；↓/↑ 跳到结果列表
 static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM wp, LPARAM lp,
                                      UINT_PTR id, DWORD_PTR ref) {
+    // RichEdit 是 ES_MULTILINE，Tab 会被它当成制表符插进关键词（还会把关键词
+    // 拆成两个词做 AND）。这里直接接管，转给主窗口的焦点链。
+    if (m == WM_KEYDOWN && wp == VK_TAB) {
+        CycleFocus((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        return 0;
+    }
     if (m == WM_KEYDOWN && wp == VK_RETURN) {
         // Ctrl+Enter = 加载更多，交给主窗口处理；单独 Enter 才是搜索
         if (GetKeyState(VK_CONTROL) & 0x8000) {
@@ -272,7 +279,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM wp, LPARAM lp,
         SendMessageW(h, EM_SETSEL, 0, -1);   // 已经在这里：全选，方便重打
         return 0;
     }
-    if (m == WM_CHAR && (wp == L'\r' || wp == L'\n')) return 0;
+    if (m == WM_CHAR && (wp == L'\r' || wp == L'\n' || wp == L'\t')) return 0;
     return DefSubclassProc(h, m, wp, lp);
 }
 
@@ -324,7 +331,13 @@ static void StartSearch(const std::wstring& keyword, bool fromCapture = false) {
 
     SearchResultMsg* msg = new SearchResultMsg();
     msg->seq = ++g.seq;
-    msg->outcome.keyword = kw;
+    // 设置快照在主线程取：工作线程只读 msg->req
+    msg->req.keyword      = kw;
+    msg->req.rootDir      = g.settings.rootDir;
+    msg->req.searchOffice = g.settings.searchOffice;
+    msg->req.contextLevel = g.settings.contextLevel;
+    msg->req.maxResults   = g.settings.maxResults;
+    msg->outcome.keyword  = kw;
 
     g.selected = -1;
     g.scrollY  = 0;
@@ -537,6 +550,8 @@ static void OnCaptureDone(CaptureResultMsg* msg) {
         return;
     }
 
+    g_attemptsAtPoint = 0;   // 取到了，重点位的重试计数归零
+
     g.lastOcrRaw = msg->raw;
     std::wstring clean = (msg->haveX && msg->charX.size() == msg->raw.size())
         ? CleanOcrTextByX(msg->raw, msg->charX, msg->mouseX)
@@ -569,6 +584,7 @@ static void OnPollTick() {
         g_lastPt = p;
         g_stillSince = GetTickCount();
         g_fired = false;
+        g_attemptsAtPoint = 0;
         SetLeftStatus(L"");
         return;
     }
@@ -603,8 +619,16 @@ static void OnPollTick() {
     DWORD now = GetTickCount();
     if (g_fired && (DWORD)(now - g_lastAttempt) < 1200) return;
 
+    // 同一个点连续 3 次都没取到文字就停下来：鼠标停在桌面/图片/按钮上时，
+    // 否则会每 1.2 秒截两次屏 + 跑一遍 OCR，白烧 CPU 且状态栏一直闪
+    if (g_attemptsAtPoint >= 3) {
+        SetLeftStatus(L"此处没取到文字 · 移动鼠标后重试");
+        return;
+    }
+
     g_fired = true;
     g_lastAttempt = now;
+    ++g_attemptsAtPoint;
     SetLeftStatus(L"取词中…");
 
     // 取词放进工作线程：UIA 卡住只影响这一次取词，界面不冻

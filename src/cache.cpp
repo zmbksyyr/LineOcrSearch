@@ -67,9 +67,16 @@ std::wstring FromUtf8(const std::string& s) {
     return w;
 }
 
-// key = 绝对路径 | 大小 | 修改时间
+// 解析器版本：文档提取逻辑一改就 +1。
+// 缓存文件名只由路径决定（改一次文档就覆盖同一个文件），但头行 key 里带着版本，
+// 对不上就当失效重建 —— 否则解析器修好了 bug，用户还在读修好之前的旧文本。
+constexpr const char* kParserVersion = "p3";
+
+// key = 绝对路径 | 解析器版本 | 大小 | 修改时间
 std::string MakeKey(const std::wstring& path, unsigned size, unsigned long long mtime) {
     std::string k = Utf8(path);
+    k += '|';
+    k += kParserVersion;
     k += '|';
     k += std::to_string(size);
     k += '|';
@@ -179,9 +186,11 @@ bool ReadDiskHeader(const std::string& key) {
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
 
-    char buf[8192];
+    // 头行就是整条 key。长路径（\\?\ 最多 32767 个 UTF-16 字符，转 UTF-8 后
+    // 可能接近 96KB）要留够余量，否则超长路径的缓存永远判失效、每次搜索都重建。
+    std::string buf(128 * 1024, '\0');
     DWORD got = 0;
-    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf), &got, nullptr);
+    BOOL ok = ReadFile(h, &buf[0], (DWORD)buf.size(), &got, nullptr);
     CloseHandle(h);
     if (!ok || got == 0) return false;
 
@@ -189,10 +198,12 @@ bool ReadDiskHeader(const std::string& key) {
     while (len < got && buf[len] != '\n') ++len;
     if (len >= got) return false;          // 头行没读完，按失效处理
     if (key.size() != len) return false;
-    return memcmp(buf, key.data(), len) == 0;
+    return memcmp(buf.data(), key.data(), len) == 0;
 }
 
 void EnforceDiskQuota(const std::wstring& dir);
+int  BatchDepth();          // 批量写入深度（内部加锁读）
+void EnforceQuotaLocked();  // 在锁内做一次配额检查
 
 void WriteDisk(const std::string& key, const std::vector<std::wstring>& lines) {
     std::wstring dir = SubDirPath(cfgpaths::kCacheDir);
@@ -213,7 +224,7 @@ void WriteDisk(const std::string& key, const std::vector<std::wstring>& lines) {
     WriteFile(h, out.data(), (DWORD)out.size(), &wr, nullptr);
     CloseHandle(h);
 
-    if (g_batchDepth == 0) EnforceDiskQuota(dir);
+    if (BatchDepth() == 0) EnforceQuotaLocked();
 }
 
 // ---- 磁盘总量上限：可在设置里改，超过上限就按最后写入时间从旧到新删 ----
@@ -269,6 +280,16 @@ void EnforceDiskQuota(const std::wstring& dir) {
     }
 }
 
+int BatchDepth() {
+    CacheGuard g;
+    return g_batchDepth;
+}
+
+void EnforceQuotaLocked() {
+    CacheGuard g;
+    EnforceDiskQuota(SubDirPath(cfgpaths::kCacheDir));
+}
+
 }  // namespace
 
 void CacheSetLimitMB(int mb) {
@@ -291,34 +312,53 @@ void CacheBeginBatch() {
 }
 
 void CacheEndBatch() {
-    CacheGuard g;
-    if (g_batchDepth > 0) --g_batchDepth;
-    if (g_batchDepth == 0) EnforceDiskQuota(SubDirPath(cfgpaths::kCacheDir));
+    bool last = false;
+    {
+        CacheGuard g;
+        if (g_batchDepth > 0) --g_batchDepth;
+        last = (g_batchDepth == 0);
+    }
+    if (last) EnforceQuotaLocked();   // 扫目录 + 删除放到锁外
 }
 
 bool CacheGet(const std::wstring& path, unsigned size, unsigned long long mtime,
               std::vector<std::wstring>& lines) {
     std::string key = MakeKey(path, size, mtime);
-    CacheGuard g;
 
+    {
+        CacheGuard g;
+        std::unordered_map<std::string, MemEntry>::iterator it = g_mem.find(key);
+        if (it != g_mem.end()) {
+            lines = it->second.lines;
+            TouchLru(key);
+            return true;
+        }
+    }
+
+    // 读盘放到锁外：一次 open + read 是小文件 0.3–0.6ms，持锁会让「生成缓存」期间
+    // 的搜索排队等锁，表现为偶发卡 1–2 秒。读失败不缓存，交给上层重建。
+    std::vector<std::wstring> tmp;
+    if (!ReadDisk(key, tmp)) return false;
+
+    CacheGuard g;   // 回锁内二次确认：别的线程可能刚好也读到了同一份
     std::unordered_map<std::string, MemEntry>::iterator it = g_mem.find(key);
     if (it != g_mem.end()) {
         lines = it->second.lines;
         TouchLru(key);
         return true;
     }
-    if (ReadDisk(key, lines)) {
-        MemStore(key, lines);
-        return true;
-    }
-    return false;
+    lines.swap(tmp);
+    MemStore(key, lines);
+    return true;
 }
 
 bool CacheHas(const std::wstring& path, unsigned size, unsigned long long mtime) {
     std::string key = MakeKey(path, size, mtime);
-    CacheGuard g;
-    if (g_mem.find(key) != g_mem.end()) return true;
-    return ReadDiskHeader(key);
+    {
+        CacheGuard g;
+        if (g_mem.find(key) != g_mem.end()) return true;
+    }
+    return ReadDiskHeader(key);   // 只读头行，同样放在锁外
 }
 
 // 清空内存缓存 + 删除 cache\ 下的缓存文件（只动自己的缓存，不碰别处）
@@ -345,8 +385,9 @@ void CachePut(const std::wstring& path, unsigned size, unsigned long long mtime,
               const std::vector<std::wstring>& lines) {
     if (lines.empty()) return;
     std::string key = MakeKey(path, size, mtime);
-
-    CacheGuard g;
-    MemStore(key, lines);
-    WriteDisk(key, lines);
+    {
+        CacheGuard g;
+        MemStore(key, lines);
+    }
+    WriteDisk(key, lines);   // 写盘（含配额检查）在锁外，别的线程照样能读缓存
 }
