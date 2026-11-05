@@ -29,4 +29,9 @@ void RecalcTotalHeight();   // 结果变化或窗口宽度变化后重算折行�
 void EnsureItemVisible(int index);
 void CopyResultToClipboard(const ResultItem& it);
 void OpenItem(int index);
+void OpenItemFolder(int index);        // 在资源管理器里定位文件
+void CopyItemPath(int index);          // 只复制文件路径
+void ScrollListByPixels(int dy);       // 按像素滚动（自动夹紧），翻页键用
+void ScrollListToEdge(bool bottom);    // 滚到顶/底
+bool ListMenuOpen();                   // 右键菜单是否正在弹出（此期间列表不吃键盘）
 LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);

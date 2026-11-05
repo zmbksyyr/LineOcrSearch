@@ -234,7 +234,7 @@ static void EditSetUsed(size_t used) {
     }
 }
 
-// 单行输入：回车直接搜索，不让插换行
+// 单行输入：回车直接搜索，不让插换行；↓/↑ 跳到结果列表
 static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM wp, LPARAM lp,
                                      UINT_PTR id, DWORD_PTR ref) {
     if (m == WM_KEYDOWN && wp == VK_RETURN) {
@@ -244,8 +244,52 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM wp, LPARAM lp,
         }
         return 0;
     }
+    // ↓/↑：单行输入框里没有别的含义，直接进结果列表
+    if (m == WM_KEYDOWN && (wp == VK_DOWN || wp == VK_UP)) {
+        if (g_hwndList && !g.outcome.items.empty()) {
+            int last = (int)g.outcome.items.size() - 1;
+            g.selected = (wp == VK_DOWN) ? 0 : last;
+            EnsureItemVisible(g.selected);
+            InvalidateRect(g_hwndList, nullptr, TRUE);
+            SetFocus(g_hwndList);
+            return 0;
+        }
+    }
+    if (m == WM_KEYDOWN && wp == L'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        SendMessageW(h, EM_SETSEL, 0, -1);   // 已经在这里：全选，方便重打
+        return 0;
+    }
     if (m == WM_CHAR && (wp == L'\r' || wp == L'\n')) return 0;
     return DefSubclassProc(h, m, wp, lp);
+}
+
+// 把焦点送回搜索框并全选（Ctrl+F）
+static void FocusSearchBox() {
+    if (!g_hwndEdit) return;
+    SetFocus(g_hwndEdit);
+    SendMessageW(g_hwndEdit, EM_SETSEL, 0, -1);
+}
+
+// Tab 在「输入框 → 搜索 → 设置 → 结果列表」之间循环
+static HWND TabStopAt(int i) {
+    switch (i) {
+        case 0: return g_hwndEdit;
+        case 1: return g_hwndBtnSearch;
+        case 2: return g_hwndBtnSet;
+        default: return g_hwndList;
+    }
+}
+static const int kTabStops = 4;
+
+static void CycleFocus(bool back) {
+    HWND focus = GetFocus();
+    int cur = -1;
+    for (int i = 0; i < kTabStops; ++i) {
+        if (TabStopAt(i) == focus) { cur = i; break; }
+    }
+    if (cur < 0) cur = back ? 0 : kTabStops - 1;
+    int next = (cur + (back ? kTabStops - 1 : 1)) % kTabStops;
+    if (HWND t = TabStopAt(next)) SetFocus(t);
 }
 
 static void StartSearch(const std::wstring& keyword, bool fromCapture = false) {
@@ -720,7 +764,7 @@ static void PaintMain(HWND hwnd) {
 
 static void CreateControls(HWND hwnd) {
     const wchar_t* editCls = g_richOk ? MSFTEDIT_CLASS : L"EDIT";
-    DWORD editStyle = WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL;
+    DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NOHIDESEL;
     if (g_richOk) editStyle |= ES_MULTILINE;   // RichEdit 即使是单行也必须带
 
     g_hwndEdit = CreateWindowExW(0, editCls, L"", editStyle,
@@ -743,7 +787,7 @@ static void CreateControls(HWND hwnd) {
     g_hwndBtnSet = CreateFlatButton(hwnd, IDC_BTN_SET, L"设置", false);
 
     g_hwndList = CreateWindowExW(0, L"LineOcrList", L"",
-        WS_CHILD | WS_VISIBLE,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         0, 0, 100, 100, hwnd, (HMENU)IDC_LIST, nullptr, nullptr);
 }
 
@@ -816,8 +860,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_KEYDOWN: {
-            // 键盘导航只在焦点不在输入框时生效（在输入框里打字/光标不受影响）
+            if (ListMenuOpen()) break;          // 右键菜单开着时，键盘交给菜单
             HWND focus = GetFocus();
+            const bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+            // Tab 循环（输入框 / 搜索 / 设置 / 结果列表）
+            if (wp == VK_TAB) { CycleFocus(shift); return 0; }
+
+            // 不依赖焦点的几个：Ctrl+F 回搜索框、F5 重搜
+            if (ctrl && (wp == L'F' || wp == 'F')) { FocusSearchBox(); return 0; }
+            if (wp == VK_F5) {
+                if (g.settings.rootDir.empty()) { g.statusNote = L"请先拖一个文件夹到窗口"; SetStatus(); }
+                else StartSearch(EditText());
+                return 0;
+            }
+
+            // 键盘导航只在焦点不在输入框时生效（在输入框里打字/光标不受影响）
             if (focus != hwnd && focus != g_hwndList) break;
 
             if (wp == VK_DOWN || wp == VK_UP) {
@@ -833,6 +892,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(g_hwndList, nullptr, TRUE);
                 return 0;
             }
+            // 翻页 / 首尾
+            if (wp == VK_PRIOR || wp == VK_NEXT) {
+                RECT lrc{};
+                GetClientRect(g_hwndList, &lrc);
+                int page = lrc.bottom - g_lineH * 2;
+                if (page < g_lineH * 2) page = g_lineH * 2;
+                ScrollListByPixels(wp == VK_PRIOR ? -page : page);
+                return 0;
+            }
+            if (wp == VK_HOME) { ScrollListToEdge(false); return 0; }
+            if (wp == VK_END)  { ScrollListToEdge(true);  return 0; }
+
             if (wp == VK_RETURN) {
                 if (g.selected >= 0 && g.selected < (int)g.outcome.items.size()) {
                     OpenItem(g.selected);
@@ -844,9 +915,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(g_hwndList, nullptr, TRUE);
                 return 0;
             }
-            if (wp == L'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (ctrl && (wp == L'C' || wp == 'C')) {
                 if (g.selected >= 0 && g.selected < (int)g.outcome.items.size()) {
-                    CopyResultToClipboard(g.outcome.items[g.selected]);
+                    if (shift) CopyItemPath(g.selected);        // Ctrl+Shift+C：只复制路径
+                    else       CopyResultToClipboard(g.outcome.items[g.selected]);
                 }
                 return 0;
             }
@@ -978,6 +1050,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     ShowWindow(g_hwndMain, nCmdShow);
     UpdateWindow(g_hwndMain);
+    if (g_hwndEdit) SetFocus(g_hwndEdit);   // 启动即可直接打字，↓ 进结果列表
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

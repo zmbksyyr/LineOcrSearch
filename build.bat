@@ -12,7 +12,7 @@ echo [build] compiling with zig c++ ...
 "%ZIG%" c++ -target x86_64-windows-gnu -municode -DUNICODE -D_UNICODE -O2 ^
   -Wl,--subsystem,windows ^
   src\main.cpp src\config.cpp src\text_clean.cpp src\search.cpp src\uia.cpp ^
-  src\capture.cpp src\ocr_onnx.cpp src\office.cpp src\settings.cpp src\cache.cpp ^
+  src\capture.cpp src\ocr_onnx.cpp src\office.cpp src\legacy_office.cpp src\settings.cpp src\cache.cpp ^
   src\bundle.cpp src\align.cpp src\listview.cpp src\theme.cpp src\flatbutton.cpp src\icon.cpp ^
   -o dist\LineOcrSearch.exe ^
   -luser32 -lgdi32 -lcomctl32 -lole32 -loleaut32 -lshell32 -lshlwapi -lcomdlg32 -luuid -loleacc

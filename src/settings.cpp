@@ -119,10 +119,143 @@ static void SaveFromControls() {
     else g_edit.cacheMB = 64;
 }
 
-static void PickFolder() {
-    wchar_t cur[1024] = {0};
-    GetWindowTextW(GetDlgItem(g_dlg, IDC_SET_PATH), cur, 1024);
+// ---------------- 建立缓存（浏览完目录 / 点“生成缓存”都走这里）----------------
 
+static bool g_building = false;      // 建立缓存中：挡掉设置窗口的其它命令
+static bool g_buildCancel = false;   // 用户按了“停止”或关窗
+static bool g_buildClose = false;    // 建立过程中关了窗：停下来之后真的关掉
+
+static std::wstring TrimPath(const std::wstring& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == L' ' || s[b] == L'\t')) ++b;
+    while (e > b && (s[e - 1] == L' ' || s[e - 1] == L'\t')) --e;
+    std::wstring t = s.substr(b, e - b);
+    if (t.size() >= 2 && t.front() == L'"' && t.back() == L'"') t = t.substr(1, t.size() - 2);
+    return t;
+}
+
+// 每处理完一个文件回调一次：顺手抽消息，界面不假死
+struct BuildUi {
+    HWND dlg = nullptr;
+    HWND info = nullptr;
+    DWORD last = 0;
+};
+
+static bool BuildPump(void* user, const CacheBuildStats& st) {
+    BuildUi* ui = (BuildUi*)user;
+    if (g_buildCancel) return false;
+
+    MSG m;
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+        if (m.message == WM_QUIT) {     // 程序要退出：收手，并把退出消息放回去
+            PostQuitMessage((int)m.wParam);
+            return false;
+        }
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+        if (g_buildCancel) return false;
+    }
+
+    DWORD now = GetTickCount();
+    if (now - ui->last >= 120) {
+        ui->last = now;
+        wchar_t buf[160];
+        swprintf(buf, 160, L"正在建立缓存… 已检查 %d 个文件，新写入 %d 个", st.found, st.built);
+        SetWindowTextW(ui->info, buf);
+    }
+    return true;
+}
+
+static void BuildCacheNow(HWND h, const std::wstring& dir) {
+    HWND info = GetDlgItem(h, IDC_SET_CAPINFO);
+    HWND btnCancel = GetDlgItem(h, IDC_SET_CANCEL);
+
+    DWORD attr = GetFileAttributesW(dir.c_str());
+    if (dir.empty() || attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        SetWindowTextW(info, L"文件夹不存在或无法访问");
+        MessageBoxW(h, L"文件夹不存在或无法访问，未生成缓存。", L"生成缓存",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // 只留“停止”可点，其余控件禁用，避免建立过程中改设置或再次触发
+    std::vector<HWND> disabled;
+    for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        if (c == btnCancel || !IsWindowEnabled(c)) continue;
+        EnableWindow(c, FALSE);
+        disabled.push_back(c);
+    }
+    SetFlatButtonText(btnCancel, L"停止");
+    SetWindowTextW(info, L"正在建立缓存…");
+    SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
+
+    BuildUi ui;
+    ui.dlg = h;
+    ui.info = info;
+    ui.last = GetTickCount();
+
+    g_buildCancel = false;
+    g_building = true;
+    CacheBuildStats st = CacheBuildForDir(dir, BuildPump, &ui);
+    g_building = false;
+
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    SetFlatButtonText(btnCancel, L"取消");
+    for (size_t i = 0; i < disabled.size(); ++i) EnableWindow(disabled[i], TRUE);
+
+    if (g_buildClose) {          // 用户是按关闭走人的：现在才真的关
+        g_buildClose = false;
+        DestroyWindow(h);
+        return;
+    }
+
+    if (st.canceled) {
+        SetWindowTextW(info, L"已停止建立缓存");
+        return;
+    }
+
+    int okCount = st.built + st.reused;
+    if (okCount == 0) {
+        // 两种入口（浏览 / 点按钮）都没产出缓存时，统一提示
+        if (st.quotaFull) {
+            SetWindowTextW(info, L"缓存空间已满，未生成新缓存");
+            MessageBoxW(h, L"缓存已达到磁盘上限，未生成新缓存。\n\n"
+                           L"可以在下面把「缓存最多占多少磁盘」调大后重试。",
+                        L"生成缓存", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (st.found == 0) {
+            SetWindowTextW(info, L"该目录没有支持的文件，未生成缓存");
+            std::wstring msg = L"该目录没有支持的文件，未生成缓存。\n\n"
+                               L"支持 txt / md / csv / json / docx / doc / xlsx / xls 等文本与 Office 文件，\n"
+                               L"文本单文件不超过 2 MB，Office 不超过 16 MB。\n\n";
+            msg += dir;
+            MessageBoxW(h, msg.c_str(), L"生成缓存", MB_OK | MB_ICONINFORMATION);
+        } else {
+            SetWindowTextW(info, L"该目录的文件都没能读出文字，未生成缓存");
+            std::wstring msg = L"该目录里的文件都没能读出文字，未生成缓存。\n\n"
+                               L"可能是文件为空、已加密，或格式与后缀不符。\n\n";
+            msg += dir;
+            MessageBoxW(h, msg.c_str(), L"生成缓存", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
+    wchar_t buf[256];
+    if (st.quotaFull) {
+        swprintf(buf, 256, L"缓存已建立 %d 个文件，达到上限（%u MB）后停止",
+                 okCount, (unsigned)(CacheLimitBytes() >> 20));
+    } else if (st.failed > 0) {
+        swprintf(buf, 256, L"缓存已建立 %d 个文件（新写入 %d，复用 %d，%d 个读取失败）",
+                 okCount, st.built, st.reused, st.failed);
+    } else {
+        swprintf(buf, 256, L"缓存已建立 %d 个文件（新写入 %d，复用 %d）",
+                 okCount, st.built, st.reused);
+    }
+    SetWindowTextW(info, buf);
+}
+
+static void PickFolder() {
     BROWSEINFOW bi{};
     bi.hwndOwner = g_dlg;
     bi.lpszTitle = L"选择要搜索的文件夹";
@@ -133,6 +266,7 @@ static void PickFolder() {
     wchar_t path[MAX_PATH] = {0};
     if (SHGetPathFromIDListW(pidl, path)) {
         SetWindowTextW(GetDlgItem(g_dlg, IDC_SET_PATH), path);
+        BuildCacheNow(g_dlg, path);          // 选完目录立刻把缓存建起来
     }
     CoTaskMemFree(pidl);
 }
@@ -152,7 +286,7 @@ static void CreateControls(HWND h) {
     SetCtlFont(e);
     CreateFlatButton(h, IDC_SET_BROWSE, L"浏览", false);
     MoveWindow(GetDlgItem(h, IDC_SET_BROWSE), x + 348, y, 76, 34, TRUE);
-    CreateFlatButton(h, IDC_SET_CLEARCACHE, L"重建缓存", false);
+    CreateFlatButton(h, IDC_SET_CLEARCACHE, L"生成缓存", false);
     MoveWindow(GetDlgItem(h, IDC_SET_CLEARCACHE), x + 432, y, 104, 34, TRUE);
 
     y += 54;
@@ -298,11 +432,15 @@ static void CreateControls(HWND h) {
     CreateFlatButton(h, IDC_SET_RESET, L"恢复默认", false);
     MoveWindow(GetDlgItem(h, IDC_SET_RESET), bx + wOk + gapBtn + wCancel + gapBtn, by, wReset, 32, TRUE);
 
-    // 统一字体
+    // 统一字体；顺带给可交互控件补 WS_TABSTOP，让 Tab 能走起来
     for (HWND child = GetWindow(h, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
         wchar_t cls[64] = {0};
         GetClassNameW(child, cls, 64);
         if (wcscmp(cls, L"LineOcrFlatBtn") != 0) SetCtlFont(child);
+        if (wcscmp(cls, L"STATIC") != 0) {
+            LONG_PTR style = GetWindowLongPtrW(child, GWL_STYLE);
+            SetWindowLongPtrW(child, GWL_STYLE, style | WS_TABSTOP);
+        }
     }
 }
 
@@ -350,11 +488,22 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_COMMAND: {
             int id = LOWORD(wp);
+            if (g_building) {
+                // 建立缓存期间只认“停止”；其它命令一律丢弃，防止重入
+                if (id == IDC_SET_CANCEL) g_buildCancel = true;
+                return 0;
+            }
             if (id == IDC_SET_BROWSE) { PickFolder(); return 0; }
             if (id == IDC_SET_CLEARCACHE) {
-                CacheClearAll();
-                SetWindowTextW(GetDlgItem(h, IDC_SET_CAPINFO),
-                               L"缓存已清空，下次搜索会重新建立");
+                wchar_t buf[1024] = {0};
+                GetWindowTextW(GetDlgItem(h, IDC_SET_PATH), buf, 1024);
+                std::wstring dir = TrimPath(buf);
+                if (dir.empty()) {
+                    MessageBoxW(h, L"请先选择要搜索的文件夹。", L"生成缓存",
+                                MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                BuildCacheNow(h, dir);
                 return 0;
             }
             if (id == IDC_SET_OK) {
@@ -374,6 +523,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_CLOSE:
+            if (g_building) {         // 先停下来，别拆窗
+                g_buildCancel = true;
+                g_buildClose = true;
+                return 0;
+            }
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
@@ -389,6 +543,9 @@ bool ShowSettingsDialog(HWND parent, Settings& s, const std::wstring& capNote) {
     g_parent = parent;
     g_edit = s;
     g_accepted = false;
+    g_building = false;
+    g_buildCancel = false;
+    g_buildClose = false;
 
     static bool clsDone = false;
     if (!clsDone) {
@@ -420,10 +577,22 @@ bool ShowSettingsDialog(HWND parent, Settings& s, const std::wstring& capNote) {
     UpdateWindow(g_dlg);
 
     SetWindowTextW(GetDlgItem(g_dlg, IDC_SET_CAPINFO), capNote.c_str());
+    SetFocus(GetDlgItem(g_dlg, IDC_SET_PATH));   // 打开即可直接改路径
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_QUIT) break;
+        // 对话框快捷键：Esc = 取消/关闭，Enter = 确定（建缓存期间两个都不生效）
+        if (msg.message == WM_KEYDOWN && (msg.hwnd == g_dlg || IsChild(g_dlg, msg.hwnd))) {
+            if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(g_dlg, WM_CLOSE, 0, 0);
+                continue;
+            }
+            if (msg.wParam == VK_RETURN && !g_building) {
+                SendMessageW(g_dlg, WM_COMMAND, MAKEWPARAM(IDC_SET_OK, BN_CLICKED), 0);
+                continue;
+            }
+        }
         if (!IsDialogMessageW(g_dlg, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);

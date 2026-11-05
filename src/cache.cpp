@@ -8,13 +8,36 @@
 
 namespace {
 
+// 后台搜索线程与设置窗口的“建立缓存”可能同时用缓存，公开入口统一串行化
+CRITICAL_SECTION* CacheCs() {
+    static CRITICAL_SECTION* cs = [] {
+        CRITICAL_SECTION* p = new CRITICAL_SECTION();
+        InitializeCriticalSection(p);
+        return p;
+    }();
+    return cs;
+}
+
+struct CacheGuard {
+    CacheGuard() { EnterCriticalSection(CacheCs()); }
+    ~CacheGuard() { LeaveCriticalSection(CacheCs()); }
+    CacheGuard(const CacheGuard&) = delete;
+    CacheGuard& operator=(const CacheGuard&) = delete;
+};
+
 struct MemEntry {
     std::vector<std::wstring> lines;
+    size_t chars = 0;
 };
 
 std::unordered_map<std::string, MemEntry> g_mem;
 std::list<std::string> g_lru;  // 头部最新
 const size_t kMaxMemEntries = 120;
+// 光按条数限不住内存：预建缓存会把整目录的正文都塞进来，再给一个字符总量上限，
+// 超出的只落盘不进内存，下次命中走磁盘。
+const size_t kMaxMemChars = 24u * 1024u * 1024u;
+size_t g_memChars = 0;
+int g_batchDepth = 0;  // >0 表示批量写入，暂不做逐次配额检查
 
 // FNV-1a，用于生成缓存文件名
 unsigned long long Fnv1a(const std::string& s) {
@@ -65,6 +88,20 @@ std::wstring CacheFilePath(const std::string& key) {
     return JoinPath(SubDirPath(cfgpaths::kCacheDir), name);
 }
 
+size_t CountChars(const std::vector<std::wstring>& lines) {
+    size_t n = 0;
+    for (size_t i = 0; i < lines.size(); ++i) n += lines[i].size() + 1;
+    return n;
+}
+
+void MemErase(const std::string& key) {
+    std::unordered_map<std::string, MemEntry>::iterator it = g_mem.find(key);
+    if (it == g_mem.end()) return;
+    if (g_memChars >= it->second.chars) g_memChars -= it->second.chars;
+    else g_memChars = 0;
+    g_mem.erase(it);
+}
+
 void TouchLru(const std::string& key) {
     for (std::list<std::string>::iterator it = g_lru.begin(); it != g_lru.end(); ++it) {
         if (*it == key) {
@@ -74,9 +111,30 @@ void TouchLru(const std::string& key) {
     }
     g_lru.push_front(key);
     while (g_lru.size() > kMaxMemEntries) {
-        g_mem.erase(g_lru.back());
+        MemErase(g_lru.back());
         g_lru.pop_back();
     }
+}
+
+// 放进内存 LRU；太大就只留磁盘那份，避免预建缓存时把内存撑爆
+void MemStore(const std::string& key, const std::vector<std::wstring>& lines) {
+    size_t chars = CountChars(lines);
+    MemErase(key);
+    for (std::list<std::string>::iterator it = g_lru.begin(); it != g_lru.end(); ++it) {
+        if (*it == key) {
+            g_lru.erase(it);
+            break;
+        }
+    }
+    if (chars > kMaxMemChars) return;
+    if (g_memChars + chars > kMaxMemChars) return;
+
+    MemEntry e;
+    e.lines = lines;
+    e.chars = chars;
+    g_mem[key] = e;
+    g_memChars += chars;
+    TouchLru(key);
 }
 
 bool ReadDisk(const std::string& key, std::vector<std::wstring>& lines) {
@@ -114,6 +172,26 @@ bool ReadDisk(const std::string& key, std::vector<std::wstring>& lines) {
     return true;
 }
 
+// 只看文件头那一行 key，不把正文读进来
+bool ReadDiskHeader(const std::string& key) {
+    std::wstring path = CacheFilePath(key);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    char buf[8192];
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sizeof(buf), &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got == 0) return false;
+
+    size_t len = 0;
+    while (len < got && buf[len] != '\n') ++len;
+    if (len >= got) return false;          // 头行没读完，按失效处理
+    if (key.size() != len) return false;
+    return memcmp(buf, key.data(), len) == 0;
+}
+
 void EnforceDiskQuota(const std::wstring& dir);
 
 void WriteDisk(const std::string& key, const std::vector<std::wstring>& lines) {
@@ -135,7 +213,7 @@ void WriteDisk(const std::string& key, const std::vector<std::wstring>& lines) {
     WriteFile(h, out.data(), (DWORD)out.size(), &wr, nullptr);
     CloseHandle(h);
 
-    EnforceDiskQuota(dir);
+    if (g_batchDepth == 0) EnforceDiskQuota(dir);
 }
 
 // ---- 磁盘总量上限：可在设置里改，超过上限就按最后写入时间从旧到新删 ----
@@ -143,6 +221,20 @@ static int g_limitMB = 64;  // 默认 64MB
 
 unsigned long long MaxDiskBytes() { return (unsigned long long)g_limitMB * 1024ULL * 1024ULL; }
 unsigned long long LowWaterBytes() { return MaxDiskBytes() / 10ULL * 8ULL; }  // 降到 80% 停手
+
+unsigned long long UsedBytes(const std::wstring& dir) {
+    std::wstring pattern = JoinPath(dir, L"*.cache");
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    unsigned long long total = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        total += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return total;
+}
 
 void EnforceDiskQuota(const std::wstring& dir) {
     std::wstring pattern = JoinPath(dir, L"*.cache");
@@ -182,12 +274,32 @@ void EnforceDiskQuota(const std::wstring& dir) {
 void CacheSetLimitMB(int mb) {
     if (mb < 16) mb = 16;
     if (mb > 2048) mb = 2048;
+    CacheGuard g;
     g_limitMB = mb;
+}
+
+unsigned long long CacheLimitBytes() { return MaxDiskBytes(); }
+
+unsigned long long CacheUsedBytes() {
+    CacheGuard g;
+    return UsedBytes(SubDirPath(cfgpaths::kCacheDir));
+}
+
+void CacheBeginBatch() {
+    CacheGuard g;
+    ++g_batchDepth;
+}
+
+void CacheEndBatch() {
+    CacheGuard g;
+    if (g_batchDepth > 0) --g_batchDepth;
+    if (g_batchDepth == 0) EnforceDiskQuota(SubDirPath(cfgpaths::kCacheDir));
 }
 
 bool CacheGet(const std::wstring& path, unsigned size, unsigned long long mtime,
               std::vector<std::wstring>& lines) {
     std::string key = MakeKey(path, size, mtime);
+    CacheGuard g;
 
     std::unordered_map<std::string, MemEntry>::iterator it = g_mem.find(key);
     if (it != g_mem.end()) {
@@ -196,19 +308,25 @@ bool CacheGet(const std::wstring& path, unsigned size, unsigned long long mtime,
         return true;
     }
     if (ReadDisk(key, lines)) {
-        MemEntry e;
-        e.lines = lines;
-        g_mem[key] = e;
-        TouchLru(key);
+        MemStore(key, lines);
         return true;
     }
     return false;
 }
 
+bool CacheHas(const std::wstring& path, unsigned size, unsigned long long mtime) {
+    std::string key = MakeKey(path, size, mtime);
+    CacheGuard g;
+    if (g_mem.find(key) != g_mem.end()) return true;
+    return ReadDiskHeader(key);
+}
+
 // 清空内存缓存 + 删除 cache\ 下的缓存文件（只动自己的缓存，不碰别处）
 void CacheClearAll() {
+    CacheGuard g;
     g_mem.clear();
     g_lru.clear();
+    g_memChars = 0;
 
     std::wstring dir = SubDirPath(cfgpaths::kCacheDir);
     std::wstring pattern = JoinPath(dir, L"*.cache");
@@ -228,10 +346,7 @@ void CachePut(const std::wstring& path, unsigned size, unsigned long long mtime,
     if (lines.empty()) return;
     std::string key = MakeKey(path, size, mtime);
 
-    MemEntry e;
-    e.lines = lines;
-    g_mem[key] = e;
-    TouchLru(key);
-
+    CacheGuard g;
+    MemStore(key, lines);
     WriteDisk(key, lines);
 }

@@ -18,8 +18,10 @@ static const wchar_t* kSkipDirs[] = {
 };
 
 static const int   kMaxFileBytes  = 2 * 1024 * 1024;  // 单文件上限 2 MB
+// Office 文件里常有图片，2MB 太紧；正文抽取只跟文字量有关，放宽到 16MB
+static const int   kMaxOfficeBytes = 16 * 1024 * 1024;
 static const int   kMaxDepth      = 32;               // 递归深度上限，防目录环
-static const int   kHitsPerFile   = 3;                // 同一文件最多列 3 处命中
+static const int   kHitsPerFile   = 100;              // 单文件命中上限（总量仍受“结果条数”约束，最高 100）
 static const int   kMaxScanned    = 20000;            // 单次搜索最多检查的文件数
 
 // ---------------- 小工具 ----------------
@@ -57,6 +59,13 @@ static bool IsTextExt(const std::wstring& lowerExt) {
         if (lowerExt == kTextExts[i]) return true;
     }
     return false;
+}
+
+// 能抽正文的 Office 家族：新版 OOXML + 老版 OLE 二进制
+static bool IsOfficeExt(const std::wstring& lowerExt) {
+    return lowerExt == L".docx" || lowerExt == L".docm" ||
+           lowerExt == L".xlsx" || lowerExt == L".xlsm" ||
+           lowerExt == L".doc"  || lowerExt == L".xls";
 }
 
 static bool IsSkippedDir(const std::wstring& name) {
@@ -188,7 +197,7 @@ void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const
 
     std::wstring ext = LowerExt(name);
     bool isText = IsTextExt(ext);
-    bool isOffice = (ext == L".docx" || ext == L".xlsx" || ext == L".xlsm");
+    bool isOffice = IsOfficeExt(ext);
     if (!isText && !isOffice) return;
     if (isOffice && !req->searchOffice) return;
 
@@ -288,7 +297,10 @@ void Walker::Walk(const std::wstring& dir, const std::wstring& rel, int depth) {
             Walk(full, childRel, depth + 1);
         } else {
             if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
-            if (fd.nFileSizeHigh != 0 || fd.nFileSizeLow > (DWORD)kMaxFileBytes) {
+            // Office 放宽到 16MB，纯文本仍是 2MB
+            unsigned limit = IsOfficeExt(LowerExt(name)) ? (unsigned)kMaxOfficeBytes
+                                                        : (unsigned)kMaxFileBytes;
+            if (fd.nFileSizeHigh != 0 || fd.nFileSizeLow > limit) {
                 // 超限文件跳过；Office 也一并跳过，避免卡顿
                 continue;
             }
@@ -301,6 +313,137 @@ void Walker::Walk(const std::wstring& dir, const std::wstring& rel, int depth) {
     } while (FindNextFileW(h, &fd));
 
     FindClose(h);
+}
+
+// ---------------- 为整个目录预建缓存 ----------------
+// 与搜索用同一套后缀表、大小上限、跳过目录规则，保证「能搜到的」和「预热过的」是一批文件。
+namespace {
+
+struct CacheBuilder {
+    CacheBuildStats st;
+    CacheBuildProgressFn progress = nullptr;
+    void* user = nullptr;
+    unsigned long long budget = 0;   // 还能往缓存里写多少字节
+    unsigned long long written = 0;
+
+    bool Full() const { return st.canceled || st.quotaFull; }
+
+    void Tick() {
+        if (st.canceled) return;
+        if (progress && !progress(user, st)) st.canceled = true;
+    }
+
+    void HandleFile(const std::wstring& full, const std::wstring& name,
+                    unsigned long long fsize, unsigned long long mtime) {
+        std::wstring ext = LowerExt(name);
+        bool isText   = IsTextExt(ext);
+        bool isOffice = IsOfficeExt(ext);
+        if (!isText && !isOffice) return;
+
+        st.found++;
+        unsigned long long limit = isOffice ? (unsigned long long)kMaxOfficeBytes
+                                            : (unsigned long long)kMaxFileBytes;
+        if (fsize == 0 || fsize > limit) {
+            st.tooBig++;
+            Tick();
+            return;
+        }
+        if (written >= budget) {   // 缓存配额已满：后面的不再写
+            st.quotaFull = true;
+            return;
+        }
+
+        unsigned size = (unsigned)fsize;
+        if (CacheHas(full, size, mtime)) {   // 已经是最新的，不重复解析
+            st.reused++;
+            Tick();
+            return;
+        }
+
+        std::wstring text;
+        std::vector<std::wstring> lines;
+        bool ok;
+        if (isText) {
+            std::string raw;
+            ok = ReadWholeFile(full, kMaxFileBytes, raw) && DecodeBytes(raw, text);
+        } else {
+            ok = ExtractOfficeText(full, text);
+        }
+        if (ok) SplitLines(text, lines);
+        // 与搜索保持一致：空文档、超大文档不缓存
+        if (!ok || lines.empty() || lines.size() > 50000) {
+            st.failed++;
+            Tick();
+            return;
+        }
+
+        // 估算落盘体积（UTF-16 → UTF-8 大约 1~3 字节/字符），用于控制总预算
+        unsigned long long approx = 64;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            approx += (unsigned long long)lines[i].size() * 2ULL + 1ULL;
+        }
+        CachePut(full, size, mtime, lines);
+        st.built++;
+        written += approx;
+        Tick();
+    }
+
+    void Walk(const std::wstring& dir, int depth) {
+        if (depth > kMaxDepth || Full()) return;
+
+        std::wstring pattern = JoinPath(dir, L"*");
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+
+        do {
+            const wchar_t* nm = fd.cFileName;
+            if (nm[0] == L'.' && (nm[1] == L'\0' || (nm[1] == L'.' && nm[2] == L'\0'))) continue;
+
+            std::wstring name(nm);
+            std::wstring full = JoinPath(dir, name);
+
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (IsSkippedDir(name)) continue;
+                Walk(full, depth + 1);
+            } else {
+                if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;  // 防符号链接绕圈
+                unsigned long long sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                unsigned long long mtime =
+                    ((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                    (unsigned long long)fd.ftLastWriteTime.dwLowDateTime;
+                HandleFile(full, name, sz, mtime);
+            }
+        } while (!Full() && FindNextFileW(h, &fd));
+
+        FindClose(h);
+    }
+};
+
+}  // namespace
+
+CacheBuildStats CacheBuildForDir(const std::wstring& dir,
+                                 CacheBuildProgressFn progress, void* user) {
+    CacheBuilder b;
+    b.progress = progress;
+    b.user = user;
+    if (dir.empty()) return b.st;
+
+    DWORD attr = GetFileAttributesW(dir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return b.st;
+
+    // 先把已有缓存压回配额以内，再按剩余空间决定这次最多写多少
+    CacheBeginBatch();
+    CacheEndBatch();
+    unsigned long long limit = CacheLimitBytes();
+    unsigned long long used  = CacheUsedBytes();
+    b.budget = (used >= limit) ? 0 : (limit - used);
+
+    CacheBeginBatch();
+    b.Walk(dir, 0);
+    CacheEndBatch();
+    return b.st;
 }
 
 SearchOutcome RunSearch(const SearchRequest& req) {

@@ -253,9 +253,13 @@ struct ZipArchive {
         // 从尾部向前找 EOCD
         size_t maxBack = data.size() > 66000 ? 66000 : data.size();
         size_t eocd = (size_t)-1;
-        for (size_t i = data.size() - 22; i + 4 <= data.size(); --i) {
+        // 注意：不能写成 `for (i = size-22; i + 4 <= size; --i)`，
+        // i 减到 0 之后会回绕成 SIZE_MAX，i + 4 又绕回 3，条件仍然成立，
+        // 于是拿 SIZE_MAX 当下标去读，遇到不是 zip 的 .docx/.xlsx 就直接崩。
+        const size_t first = data.size() - 22;
+        for (size_t i = first + 1; i-- > 0; ) {
             if (ReadU32(&data[i]) == 0x06054b50u) { eocd = i; break; }
-            if (data.size() - i > maxBack) break;
+            if (first - i > maxBack) break;
         }
         if (eocd == (size_t)-1) return false;
 
@@ -502,6 +506,23 @@ static void ExtractSheetXml(const std::string& xml, const std::vector<std::wstri
 
 // ======================= 对外入口 =======================
 
+// 去掉过多空行：正文里段落之间的空行保留，连续的只留两行
+static void CleanupText(std::wstring& text) {
+    std::wstring cleaned;
+    cleaned.reserve(text.size());
+    int blank = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        wchar_t c = text[i];
+        if (c == L'\n') {
+            if (++blank > 2) continue;
+        } else if (c != L'\r') {
+            blank = 0;
+        }
+        cleaned += c;
+    }
+    text.swap(cleaned);
+}
+
 bool ExtractOfficeText(const std::wstring& path, std::wstring& outText) {
     outText.clear();
 
@@ -510,11 +531,20 @@ bool ExtractOfficeText(const std::wstring& path, std::wstring& outText) {
     std::wstring ext = path.substr(dot);
     for (size_t i = 0; i < ext.size(); ++i) ext[i] = (wchar_t)towlower(ext[i]);
 
-    // .doc / .xls 老二进制格式不做内容解析，交由上层按文件名匹配
-    if (ext == L".doc" || ext == L".xls") return false;
+    // Word 97-2003 / Excel 97-2003：不是 zip，走 OLE 复合文档解析
+    if (ext == L".doc" || ext == L".xls") {
+        if (!ExtractLegacyOfficeText(path, outText)) return false;
+        CleanupText(outText);
+        return !outText.empty();
+    }
 
     ZipArchive zip;
-    if (!zip.Open(path)) return false;
+    if (!zip.Open(path)) {
+        // 后缀像新格式、内容其实是老格式（改过后缀 / 另存出错），再按老的试一次
+        if (!ExtractLegacyOfficeText(path, outText)) return false;
+        CleanupText(outText);
+        return !outText.empty();
+    }
 
     std::vector<unsigned char> buf;
     std::wstring text;
@@ -548,20 +578,7 @@ bool ExtractOfficeText(const std::wstring& path, std::wstring& outText) {
         return false;
     }
 
-    // 去掉过多空行
-    std::wstring cleaned;
-    cleaned.reserve(text.size());
-    int blank = 0;
-    for (size_t i = 0; i < text.size(); ++i) {
-        wchar_t c = text[i];
-        if (c == L'\n') {
-            if (++blank > 2) continue;
-        } else if (c != L'\r') {
-            blank = 0;
-        }
-        cleaned += c;
-    }
-
-    outText = cleaned;
+    CleanupText(text);
+    outText = text;
     return !outText.empty();
 }

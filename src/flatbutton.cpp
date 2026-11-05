@@ -52,6 +52,13 @@ void DrawBtn(HWND h, BtnState* st) {
     TextOutW(mem, tx, ty, st->text.c_str(), (int)st->text.size());
     SelectObject(mem, oldFont);
 
+    // 键盘焦点提示（Tab 走到这里时能看出来）
+    if (GetFocus() == h) {
+        RECT fr{ 2, 2, rc.right - 2, rc.bottom - 2 };
+        theme::StrokeRoundRect(mem, fr, 5,
+                               st->primary ? RGB(255, 255, 255) : theme::kTextSub);
+    }
+
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -89,8 +96,43 @@ LRESULT CALLBACK BtnProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(h, nullptr, FALSE);
             }
             return 0;
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_KEYDOWN:
+            if (st && (wp == VK_SPACE || wp == VK_RETURN)) {
+                if (!st->pressed) {
+                    st->pressed = true;
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                return 0;
+            }
+            if (wp == VK_TAB) {          // 焦点循环交给父窗口
+                HWND parent = GetParent(h);
+                if (parent) {
+                    LPARAM sc = (GetKeyState(VK_SHIFT) & 0x8000) ? 0x01000000 : 0;
+                    PostMessageW(parent, WM_KEYDOWN, VK_TAB, sc);
+                }
+                return 0;
+            }
+            break;
+        case WM_KEYUP:
+            if (st && (wp == VK_SPACE || wp == VK_RETURN)) {
+                bool wasPressed = st->pressed;
+                st->pressed = false;
+                InvalidateRect(h, nullptr, FALSE);
+                HWND parent = GetParent(h);
+                if (wasPressed && parent) {
+                    SendMessageW(parent, WM_COMMAND,
+                                 MAKEWPARAM(GetDlgCtrlID(h), BN_CLICKED), (LPARAM)h);
+                }
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN:
             if (st) {
+                SetFocus(h);
                 st->pressed = true;
                 SetCapture(h);
                 InvalidateRect(h, nullptr, FALSE);

@@ -111,16 +111,40 @@ int          CountTextChars(const std::wstring& s);
 // ---- 搜索（阻塞，调用方放后台线程）----
 SearchOutcome RunSearch(const SearchRequest& req);
 
-// ---- Office 文本抽取（docx / xlsx / xlsm；老 .doc/.xls 返回 false）----
+// ---- Office 文本抽取（docx / xlsx / xlsm；老 .doc/.xls 走 legacy_office.cpp）----
 bool ExtractOfficeText(const std::wstring& path, std::wstring& outText);
+// Word 97-2003 / Excel 97-2003（OLE 复合文档）正文抽取；不支持加密文档与 95 及更早格式
+bool ExtractLegacyOfficeText(const std::wstring& path, std::wstring& outText);
 
 // ---- 文档提取缓存（内存 LRU + 数据目录下的 cache\）----
 bool CacheGet(const std::wstring& path, unsigned size, unsigned long long mtime,
               std::vector<std::wstring>& lines);
 void CachePut(const std::wstring& path, unsigned size, unsigned long long mtime,
               const std::vector<std::wstring>& lines);
+// 只判断这份文件是否已有可用缓存，不把正文读进内存（预建缓存时用）
+bool CacheHas(const std::wstring& path, unsigned size, unsigned long long mtime);
 void CacheClearAll();          // 清空内存与 cache\ 下的缓存文件
 void CacheSetLimitMB(int mb);  // 磁盘上限（MB），启动与改设置时调用；降到 80% 为止
+unsigned long long CacheLimitBytes();  // 当前上限（字节）
+unsigned long long CacheUsedBytes();   // cache\ 当前占用（字节）
+// 批量写入：期间不做逐次配额检查（几千个文件时避免反复扫目录），结束时统一查一次
+void CacheBeginBatch();
+void CacheEndBatch();
+
+// ---- 为整个目录预建缓存（浏览目录后 / 点“生成缓存”时调用）----
+struct CacheBuildStats {
+    int  found  = 0;        // 支持的类型（文本 / docx / xlsx / xlsm）的文件数
+    int  built  = 0;        // 本次写入缓存
+    int  reused = 0;        // 已有可用缓存，直接复用
+    int  failed = 0;        // 读取或解析失败，未缓存
+    int  tooBig = 0;        // 超过单文件上限，跳过
+    bool quotaFull = false; // 达到缓存上限，提前收工
+    bool canceled  = false; // 用户中途停止
+};
+// progress 返回 false 表示停止；返回后 stats.canceled 为 true
+typedef bool (*CacheBuildProgressFn)(void* user, const CacheBuildStats& st);
+CacheBuildStats CacheBuildForDir(const std::wstring& dir,
+                                 CacheBuildProgressFn progress, void* user);
 
 // ---- C1 文字层取词（主线程调用；内部走 COM / Win32，不截屏）----
 // 成功返回 true，text 为鼠标所在那一行的整行文字，source 为命中通道名；
