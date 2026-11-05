@@ -423,20 +423,26 @@ static bool OcrLineAtCursor(std::wstring& text, std::vector<double>& xs,
     const int radii[3] = { 80, 150, 300 };
     for (int ri = 0; ri < 3; ++ri) {
         CapturedBgra cap;
-        if (!CaptureBand(400, radii[ri], cap)) { fail = L"截屏失败"; continue; }
+        // 右偏条带：笔尖左边只留一丁点（判断字有没有跨过笔尖），右边才是目标。
+        // 早先左右各 400px，左边那半截除了把隔壁栏的字粘进来没别的用处。
+        if (!CaptureBandRight(24, 800, radii[ri], cap)) { fail = L"截屏失败"; continue; }
 
         MaskOwnWindow(cap);
 
         std::wstring t;
         std::vector<double> v;
         int lt = 0, lb = 0;
-        bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h, cap.mouseLocalY,
+        bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h,
+                                   cap.mouseLocalX, cap.mouseLocalY,
                                    t, &lt, &lb, &v);
         int mx = cap.mouseLocalX;
         WipeBytes(cap.px);
 
         if (!ok) { fail = L"图片里没找到文字行"; continue; }
-        if (CountTextChars(CleanOcrText(t)) < 2) { fail = L"图片里没认出文字"; continue; }
+        if (CountTextChars(TakeRightOfCursor(t, v, (double)mx)) < 2) {
+            fail = L"笔尖右边没认出文字";
+            continue;
+        }
 
         text = t;
         xs = v;
@@ -457,17 +463,13 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
     double mouseX = (double)p.x;
     bool haveX = false;
     bool estimated = false;         // 位置是按元素矩形估算的
-    int  alignPct = -1;             // 智能模式的对齐命中率
+    int  alignPct = -1;             // 智能模式下 UIA 与图片的重合度（%）
 
-    // 纯 OCR 的结果先留着：智能模式对齐失败、或文字层没结果时直接复用，不重复截屏
+    // 纯 OCR 的结果先留着：智能模式裁决、或文字层没结果时直接复用，不重复截屏
     std::wstring ocrText, ocrFail;
     std::vector<double> ocrX;
     int  ocrMouseX = 0;
     bool ocrTried = false, ocrOk = false;
-
-
-
-    // 纯 OCR 的结果先留着：智能模式对齐失败、或文字层没结果时直接复用，不重复截屏
 
     // ---- 1) 精确路径：原生 EDIT（不截屏，位置精确）----
     if (mode != 3) {
@@ -476,8 +478,8 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
         std::vector<double> xs;
         if (CaptureNativeEditLine(t, s2, &rc, &xs)) {
             std::wstring cand = (xs.size() == t.size())
-                ? CleanOcrTextByX(t, xs, (double)p.x)
-                : CleanOcrText(t);
+                ? TakeRightOfCursor(t, xs, (double)p.x)
+                : TakeRightOfCursor(t, std::vector<double>(), 0.0);
             if (CountTextChars(cand) >= 2) {
                 raw = t;
                 src = s2;
@@ -488,43 +490,86 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
         }
     }
 
-    // ---- 2) 智能：像素定位置 + UIA 校文字 ----
+    // ---- 2) 智能：图片定位置，UIA 定写法；两者差距大时以图片为准 ----
+    // 笔尖是左锚点，两条腿都只取「笔尖往右」的那一段，再比是不是同一句。
     if (!got && mode == 0) {
         ocrTried = true;
         ocrOk = OcrLineAtCursor(ocrText, ocrX, ocrMouseX, ocrFail);
-        if (!ocrOk) {
-            fail = ocrFail;
-        } else {
-            std::wstring doc;
-            AlignResult ar;
-            if (GetUiaDocumentText(p, ocrText, doc)) ar = AlignLineToDocument(doc, ocrText, 0.40);
-            if (ar.ok) {
-                std::wstring wt;
-                std::vector<double> wx;
-                BuildAlignedLine(doc, ar, ocrX, wt, wx);
-                if (!wt.empty() && wx.size() == wt.size()) {
-                    raw = wt;
-                    charX = wx;
+
+        std::wstring uiaLine, uiaSrc;
+        std::vector<double> uiaX;
+        RECT uiaRc{};
+        bool uiaOk = CaptureTextLayer(p, uiaLine, uiaSrc, &uiaRc, &uiaX);
+
+        size_t ob = 0, oe = 0;
+        std::wstring ocrSeg;
+        if (ocrOk) ocrSeg = TakeRightOfCursor(ocrText, ocrX, (double)ocrMouseX, &ob, &oe);
+
+        std::wstring uiaSeg;
+        if (uiaOk) {
+            uiaSeg = (uiaX.size() == uiaLine.size())
+                         ? TakeRightOfCursor(uiaLine, uiaX, (double)p.x)
+                         : TakeRightOfCursor(uiaLine, std::vector<double>(), 0.0);
+        }
+
+        if (!ocrSeg.empty() && !uiaSeg.empty()) {
+            double sim = TextSimilarity(ocrSeg, uiaSeg);
+            size_t small = ocrSeg.size() < uiaSeg.size() ? ocrSeg.size() : uiaSeg.size();
+            size_t big   = ocrSeg.size() > uiaSeg.size() ? ocrSeg.size() : uiaSeg.size();
+            double lenRatio = big ? (double)small / (double)big : 0.0;
+            alignPct = (int)(sim * 100.0 + 0.5);
+            bool agree = (sim >= 0.6 && lenRatio >= 0.7);
+
+            if (agree && uiaSeg.size() == ocrSeg.size() && uiaSeg != ocrSeg) {
+                // 同长度：文字换成 UIA 的（源文本不会认错字），坐标原封不动
+                std::wstring merged = ocrText.substr(0, ob) + uiaSeg + ocrText.substr(oe);
+                if (ocrX.size() == merged.size()) {
+                    raw = merged;
+                    charX = ocrX;
                     mouseX = (double)ocrMouseX;
                     haveX = true;
-                    alignPct = (int)(ar.ratio * 100.0 + 0.5);
-                    src = L"智能";
+                    src = L"智能 · UIA";
                     got = true;
                 }
             }
-            if (!got) fail = L"对齐失败";
+            if (!got) {
+                raw = ocrText;
+                charX = ocrX;
+                mouseX = (double)ocrMouseX;
+                haveX = (ocrX.size() == ocrText.size());
+                src = agree ? L"智能 · 图片" : L"智能 · 图片（UIA 差太多）";
+                got = true;
+            }
+        } else if (!ocrSeg.empty()) {
+            raw = ocrText;
+            charX = ocrX;
+            mouseX = (double)ocrMouseX;
+            haveX = (ocrX.size() == ocrText.size());
+            src = L"智能 · 图片";
+            got = true;
+        } else if (!uiaSeg.empty()) {
+            // 图片没戏，只有 UIA：位置是估的，但要告诉用户
+            raw = uiaLine;
+            charX = uiaX;
+            mouseX = (double)p.x;
+            haveX = (uiaX.size() == uiaLine.size());
+            estimated = true;
+            src = L"智能 · UIA";
+            got = true;
+        } else {
+            fail = !ocrFail.empty() ? ocrFail : std::wstring(L"两条路线都没取到文字");
         }
     }
 
-    // ---- 3) 文字层（UIA / MSAA）：自动与纯 UIA 模式的主路径，智能模式的回退 ----
-    if (!got && (mode == 1 || mode == 2 || mode == 0)) {
+    // ---- 3) 文字层（UIA / MSAA）：自动与纯 UIA 模式的主路径 ----
+    if (!got && (mode == 1 || mode == 2)) {
         std::wstring t, s2;
         RECT rc{};
         std::vector<double> xs;
         if (CaptureTextLayer(p, t, s2, &rc, &xs)) {
             std::wstring cand = (xs.size() == t.size())
-                ? CleanOcrTextByX(t, xs, (double)p.x)
-                : CleanOcrText(t);
+                ? TakeRightOfCursor(t, xs, (double)p.x)
+                : TakeRightOfCursor(t, std::vector<double>(), 0.0);
             if (CountTextChars(cand) >= 2) {
                 raw = t;
                 src = s2;
@@ -541,7 +586,7 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
     }
 
     // ---- 4) 纯 OCR 兜底 ----
-    if (!got && (mode == 0 || mode == 1 || mode == 3)) {
+    if (!got && (mode == 1 || mode == 3)) {
         if (!ocrTried) {
             ocrTried = true;
             ocrOk = OcrLineAtCursor(ocrText, ocrX, ocrMouseX, ocrFail);
@@ -596,10 +641,11 @@ static void OnCaptureDone(CaptureResultMsg* msg) {
 
     g.lastOcrRaw = msg->raw;
     std::wstring clean = (msg->haveX && msg->charX.size() == msg->raw.size())
-        ? CleanOcrTextByX(msg->raw, msg->charX, msg->mouseX)
-        : CleanOcrText(msg->raw);
+        ? TakeRightOfCursor(msg->raw, msg->charX, msg->mouseX)
+        : TakeRightOfCursor(msg->raw, std::vector<double>(), 0.0);
+    if (clean.empty() && !msg->raw.empty()) clean = CleanOcrText(msg->raw);   // 兜底：至少别空手
     std::wstring note = L"已取词 · " + msg->src;
-    if (msg->alignPct >= 0) note += L" · 对齐 " + std::to_wstring(msg->alignPct) + L"%";
+    if (msg->alignPct >= 0) note += L" · 与 UIA 重合 " + std::to_wstring(msg->alignPct) + L"%";
     if (msg->estimated) note += L" · 位置为估算";
     SetLeftStatus(note);
 

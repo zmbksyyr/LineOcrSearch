@@ -109,6 +109,18 @@ bool     SaveSettings(const Settings& s);
 std::wstring CleanOcrText(const std::wstring& raw);
 std::wstring CleanOcrTextByX(const std::wstring& raw,
                              const std::vector<double>& charX, double mouseX);
+// 笔尖左锚点取词（主链路）：笔尖只是「从这里开始」的标记，不必压在字上。
+//   1) 找笔尖右侧第一个文字字符（笔尖落在某个字内部时，从该字算起）
+//   2) 从它截到行尾
+//   3) 两端去噪（空白 / 标点 / 符号 / 开头编号），中间原样保留
+// 认不出有效文字时返回空串，由调用方决定是否回退。
+// outBegin/outEnd（可选）返回这段在 raw 里的下标区间，便于就地替换文字而保留坐标。
+std::wstring TakeRightOfCursor(const std::wstring& raw,
+                               const std::vector<double>& charX, double mouseX,
+                               size_t* outBegin = nullptr, size_t* outEnd = nullptr);
+// 两段文字的字符重合度 0..1（字符频次交集 / 较长者长度）。
+// 用来判断 UIA 与图片认的是不是同一句：差距大就以图片为准。
+double TextSimilarity(const std::wstring& a, const std::wstring& b);
 int          CountTextChars(const std::wstring& s);
 
 // ---- 搜索（阻塞，调用方放后台线程）----
@@ -164,6 +176,8 @@ struct CapturedBgra {
     std::vector<unsigned char> px;  // BGRA，自上而下
 };
 bool CaptureBand(int halfW, int halfH, CapturedBgra& out);
+// 右偏条带：光标左侧只留 leftPad，右侧取 width（取词主链路用这个）
+bool CaptureBandRight(int leftPad, int width, int halfH, CapturedBgra& out);
 void WipeBytes(std::vector<unsigned char>& buf);
 void EnablePerMonitorDpi();
 
@@ -171,7 +185,10 @@ void EnablePerMonitorDpi();
 bool        OcrInit(std::wstring& err);
 void        OcrShutdown();
 bool        OcrReady();
-bool        OcrRecognizeBgra(const unsigned char* bgra, int w, int h, int mouseY,
+// mouseX / mouseY 为光标在条带内的坐标：
+//   Y 决定「第几行」，X 决定「这一行在笔尖右侧有没有字」——右侧整段空白的行不参与候选。
+bool        OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
+                             int mouseX, int mouseY,
                              std::wstring& text, int* lineTop, int* lineBottom,
                              std::vector<double>* charX = nullptr);
 std::wstring OcrEngineInfo();

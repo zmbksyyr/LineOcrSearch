@@ -1,5 +1,6 @@
 // text_clean.cpp - OCR 结果清洗：只留纯文字，剥除首尾符号
 #include "common.h"
+#include <algorithm>
 
 struct CharKind {
     bool text;   // 字母 / 汉字 / 数字
@@ -146,6 +147,94 @@ std::wstring CleanOcrTextByX(const std::wstring& raw,
         pick = last;   // 鼠标在所有文字右侧：取最靠近的（最后）一段
     }
     return SegText(raw, segs[pick]);
+}
+
+// ---------------- 笔尖左锚点取词 ----------------
+
+static bool IsDigitKind(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return true;
+    if (c >= 0xFF10 && c <= 0xFF19) return true;   // 全角数字
+    return false;
+}
+
+// 「2026年10月」这类前缀里的单位字：紧跟在数字后面时，它只是编号的一部分
+static bool IsUnitSuffix(wchar_t c) {
+    return c == L'年' || c == L'月' || c == L'日' || c == L'号' ||
+           c == L'时' || c == L'分' || c == L'秒' || c == L'点';
+}
+
+// 笔尖只是「从这里开始」的标记，不要求压在字上：
+//   1) 找笔尖右侧第一个文字字符（笔尖落在某个字内部时从该字算起）
+//   2) 截到行尾
+//   3) 两端去噪：空白 / 标点 / 符号 / 行首编号与日期前缀；中间原样保留
+std::wstring TakeRightOfCursor(const std::wstring& raw,
+                               const std::vector<double>& charX, double mouseX,
+                               size_t* outBegin, size_t* outEnd) {
+    if (outBegin) *outBegin = 0;
+    if (outEnd) *outEnd = 0;
+    if (raw.empty()) return std::wstring();
+
+    size_t i0 = 0;
+    if (charX.size() == raw.size()) {
+        i0 = raw.size();
+        for (size_t i = 0; i < raw.size(); ++i) {
+            if (!IsHardText(raw[i])) continue;      // 标点不参与「起点」判定
+            // 这个字的右边缘：与下一个字符中心的中点（最后一个字按平均字宽外推）
+            double right;
+            if (i + 1 < raw.size() && charX[i + 1] > charX[i]) {
+                right = (charX[i] + charX[i + 1]) * 0.5;
+            } else if (i > 0 && charX[i] > charX[i - 1]) {
+                right = charX[i] + (charX[i] - charX[i - 1]) * 0.5;
+            } else {
+                right = charX[i] + 8.0;
+            }
+            if (right >= mouseX) { i0 = i; break; }
+        }
+        if (i0 >= raw.size()) return std::wstring();  // 笔尖右侧没有字，不猜
+    }
+
+    std::wstring s = raw.substr(i0);
+    if (s.empty()) return std::wstring();
+
+    size_t b = 0;
+    while (b < s.size()) {
+        if (!IsHardText(s[b])) { ++b; continue; }                        // 空白 / 数字 / 标点
+        if (b > 0 && IsUnitSuffix(s[b]) && IsDigitKind(s[b - 1])) { ++b; continue; }
+        break;
+    }
+
+    size_t e = s.size();
+    while (e > b && !IsHardText(s[e - 1])) --e;                          // 尾部标点 / 数字 / 空白
+
+    if (e <= b) return std::wstring();
+    std::wstring out = s.substr(b, e - b);
+    if (CountTextChars(out) < 1) return std::wstring();
+    if (outBegin) *outBegin = i0 + b;
+    if (outEnd) *outEnd = i0 + e;
+    return out;
+}
+
+// 字符重合度：只看「有哪些字、各出现几次」，不看顺序。
+// UIA 给的是源文本（字对、位置准），图片给的是字形（位置准、可能认错字），
+// 用它判断两者说的是不是同一句。
+double TextSimilarity(const std::wstring& a, const std::wstring& b) {
+    std::vector<wchar_t> ka, kb;
+    ka.reserve(a.size());
+    kb.reserve(b.size());
+    for (size_t i = 0; i < a.size(); ++i) if (!iswspace(a[i])) ka.push_back(a[i]);
+    for (size_t i = 0; i < b.size(); ++i) if (!iswspace(b[i])) kb.push_back(b[i]);
+    if (ka.empty() || kb.empty()) return 0.0;
+    std::sort(ka.begin(), ka.end());
+    std::sort(kb.begin(), kb.end());
+
+    size_t i = 0, j = 0, common = 0;
+    while (i < ka.size() && j < kb.size()) {
+        if (ka[i] == kb[j]) { ++common; ++i; ++j; }
+        else if (ka[i] < kb[j]) ++i;
+        else ++j;
+    }
+    size_t m = ka.size() > kb.size() ? ka.size() : kb.size();
+    return (double)common / (double)m;
 }
 
 int CountTextChars(const std::wstring& s) {

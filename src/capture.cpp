@@ -14,7 +14,8 @@ void EnablePerMonitorDpi() {
     SetProcessDPIAware();
 }
 
-bool CaptureBand(int halfW, int halfH, CapturedBgra& out) {
+// 截一块矩形（不越出虚拟屏），并把光标在其中的局部坐标一并返回
+static bool CaptureRect(int x1, int y1, int x2, int y2, CapturedBgra& out) {
     out = CapturedBgra{};
     POINT p{};
     if (!GetCursorPos(&p)) return false;
@@ -25,10 +26,10 @@ bool CaptureBand(int halfW, int halfH, CapturedBgra& out) {
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (vw <= 0 || vh <= 0) return false;
 
-    int x1 = p.x - halfW; if (x1 < vx) x1 = vx;
-    int y1 = p.y - halfH; if (y1 < vy) y1 = vy;
-    int x2 = p.x + halfW; if (x2 > vx + vw) x2 = vx + vw;
-    int y2 = p.y + halfH; if (y2 > vy + vh) y2 = vy + vh;
+    if (x1 < vx) x1 = vx;
+    if (y1 < vy) y1 = vy;
+    if (x2 > vx + vw) x2 = vx + vw;
+    if (y2 > vy + vh) y2 = vy + vh;
 
     int w = x2 - x1;
     int h = y2 - y1;
@@ -93,3 +94,24 @@ void WipeBytes(std::vector<unsigned char>& buf) {
         buf.clear();
     }
 }
+
+// 以光标为中心的对称条带（老接口，测试用）
+bool CaptureBand(int halfW, int halfH, CapturedBgra& out) {
+    POINT p{};
+    if (!GetCursorPos(&p)) { out = CapturedBgra{}; return false; }
+    if (halfW < 1) halfW = 1;
+    if (halfH < 1) halfH = 1;
+    return CaptureRect(p.x - halfW, p.y - halfH, p.x + halfW, p.y + halfH, out);
+}
+
+// 以光标为左锚点的右偏条带：左边只留 leftPad（够判断字有没有跨过笔尖），
+// 右边取 width。取词只认「笔尖往右」的文字，左边那半截除了干扰没别的作用。
+bool CaptureBandRight(int leftPad, int width, int halfH, CapturedBgra& out) {
+    POINT p{};
+    if (!GetCursorPos(&p)) { out = CapturedBgra{}; return false; }
+    if (leftPad < 0) leftPad = 0;
+    if (width < 1) width = 1;
+    if (halfH < 1) halfH = 1;
+    return CaptureRect(p.x - leftPad, p.y - halfH, p.x + width, p.y + halfH, out);
+}
+

@@ -233,7 +233,13 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
                         RECT rc{};
                         if (SUCCEEDED(c->get_CurrentBoundingRectangle(&rc))) {
                             long hgt = rc.bottom - rc.top;
-                            if (pt.y >= rc.top && pt.y <= rc.bottom && hgt > 0 && hgt <= 120) {
+                            long wid = rc.right - rc.left;
+                            // 笔尖是左锚点：元素必须落在笔尖右侧（或跨过笔尖）。
+                            // 只看 Y 时会收进同一高度上左边那一栏的元素——鼠标在正文里，
+                            // 返回的却是侧栏「空间 (0)」「暂无任务」；任务管理器的「图标 / CPU」同理。
+                            bool coversY = (pt.y >= rc.top && pt.y <= rc.bottom);
+                            bool atRight = (rc.right >= pt.x - 24);
+                            if (coversY && atRight && hgt > 0 && hgt <= 120 && wid <= 2000) {
                                 BSTR nm = nullptr;
                                 if (SUCCEEDED(c->get_CurrentName(&nm)) && nm) {
                                     std::wstring s = TakeBstr(nm);
@@ -255,10 +261,23 @@ static bool TryUiaTextPattern(IUIAutomation* uia, POINT pt, std::wstring& out,
                 });
 
                 std::vector<Cand> best;
+                long bestDist = -1;
                 for (size_t i = 0; i < cands.size(); ) {
                     size_t j = i + 1;
                     while (j < cands.size() && labs(cands[j].top - cands[i].top) <= 6) ++j;
-                    if (j - i > best.size()) {
+                    // 这一组的纵向范围，用「离笔尖最近」而不是「元素最多」来选：
+                    // 元素多的一组往往是表格行或整块面板，未必是笔尖那一行
+                    long top = cands[i].top, bottom = cands[i].bottom;
+                    for (size_t k = i; k < j; ++k) {
+                        if (cands[k].top < top) top = cands[k].top;
+                        if (cands[k].bottom > bottom) bottom = cands[k].bottom;
+                    }
+                    long dist = (pt.y < top) ? (top - pt.y)
+                                             : (pt.y > bottom ? pt.y - bottom : 0);
+                    bool better = (bestDist < 0) || (dist < bestDist) ||
+                                  (dist == bestDist && (j - i) > best.size());
+                    if (better) {
+                        bestDist = dist;
                         best.assign(cands.begin() + (long)i, cands.begin() + (long)j);
                     }
                     i = j;

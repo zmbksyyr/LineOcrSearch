@@ -81,6 +81,49 @@ static void TestClean() {
           "bad positions -> falls back to longest segment");
 }
 
+// 笔尖左锚点取词：笔尖只表示「从这里开始」，左边一律不要，右边取到行尾
+static void TestTakeRight() {
+    printf("-- TakeRightOfCursor --\n");
+    const std::wstring line = L"改为系统控件吧，这个也是丑陋，还不如用原生的好了。";
+    std::vector<double> xs;
+    for (size_t i = 0; i < line.size(); ++i) xs.push_back(10.0 + 20.0 * (double)i);
+
+    Check(TakeRightOfCursor(line, xs, 0.0) ==
+              L"改为系统控件吧，这个也是丑陋，还不如用原生的好了",
+          "cursor left of line -> whole line, tail punctuation trimmed");
+    Check(TakeRightOfCursor(line, xs, 50.0) == L"系统控件吧，这个也是丑陋，还不如用原生的好了",
+          "cursor inside a char -> starts at that char");
+    Check(TakeRightOfCursor(line, xs, 150.0) == L"这个也是丑陋，还不如用原生的好了",
+          "cursor on comma -> left side dropped, right side kept in one piece");
+    Check(TakeRightOfCursor(line, xs, 9000.0).empty(),
+          "cursor right of all text -> empty, no guessing");
+
+    // 行首编号 / 装饰符被剥掉，正文里的标点原样保留（搜索要按原句命中）
+    const std::wstring numbered = L"（3）总则：本办法适用于全线。";
+    std::vector<double> nx;
+    for (size_t i = 0; i < numbered.size(); ++i) nx.push_back(10.0 + 20.0 * (double)i);
+    Check(TakeRightOfCursor(numbered, nx, 0.0) == L"总则：本办法适用于全线",
+          "leading number + brackets cut, inner punctuation kept");
+
+    // 任务管理器那种「名字后面跟计数」的写法：两端剥掉，英文词间空格保留
+    const std::wstring proc = L"Microsoft Edge (8)";
+    std::vector<double> px;
+    for (size_t i = 0; i < proc.size(); ++i) px.push_back(10.0 + 9.0 * (double)i);
+    Check(TakeRightOfCursor(proc, px, 0.0) == L"Microsoft Edge",
+          "trailing counter cut, english space kept");
+
+    // 没有坐标表（UIA 只给了文字）：整段两端去噪
+    Check(TakeRightOfCursor(L"·【应收账款】·", std::vector<double>(), 0.0) == L"应收账款",
+          "no positions -> trim both ends only");
+
+    printf("-- TextSimilarity --\n");
+    Check(TextSimilarity(L"状态栏", L"状态栏") > 0.999, "identical -> 1.0");
+    Check(TextSimilarity(L"图标", L"状态栏") < 0.1, "unrelated -> near 0");
+    Check(TextSimilarity(L"Microsoft Edge", L"Microsoft Edge (8)") > 0.8,
+          "same words with a counter -> high");
+    Check(TextSimilarity(L"闭塞设备", L"闭塞设备") == 1.0, "cjk identical");
+}
+
 static void TestSearch() {
     printf("-- RunSearch --\n");
     // 固定相对当前工作目录，避免测试因 exe 位置不同而失效。
@@ -193,6 +236,7 @@ static void TestSearch() {
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     TestClean();
+    TestTakeRight();
     TestSearch();
     printf("----\n%s: %d failure(s)\n", g_fail == 0 ? "ALL PASS" : "FAILED", g_fail);
     return g_fail == 0 ? 0 : 1;

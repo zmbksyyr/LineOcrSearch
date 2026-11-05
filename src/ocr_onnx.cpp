@@ -411,7 +411,8 @@ static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
     return !text.empty();
 }
 
-bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h, int mouseY,
+bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
+                      int mouseX, int mouseY,
                       std::wstring& text, int* lineTop, int* lineBottom,
                       std::vector<double>* charX) {
     text.clear();
@@ -460,6 +461,13 @@ bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h, int mouseY,
         std::vector<double> xs;
         if (!RecognizeSpan(gray, w, h, top, bottom, t, &xs)) continue;
         if (CountTextChars(CleanOcrText(t)) < 2) continue;
+
+        // 笔尖是「从这里开始」的锚点：这一行在笔尖右边必须真的还有字。
+        // 没有就说明笔尖落在行尾空白或别的栏里，换下一行，不硬凑。
+        std::wstring seg = (xs.size() == t.size())
+                               ? TakeRightOfCursor(t, xs, (double)mouseX)
+                               : TakeRightOfCursor(t, std::vector<double>(), 0.0);
+        if (CountTextChars(seg) < 2) continue;
 
         text = t;
         if (charX) {
