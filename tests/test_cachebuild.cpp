@@ -25,6 +25,18 @@ static int CountCacheFiles() {
     return n;
 }
 
+// 缓存改成了单库（cache\store.bin），不能再数「每文档一个 .cache」；
+// 直接问 API：这份文件在缓存里吗
+static bool Cached(const std::wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad)) return false;
+    unsigned size = (unsigned)fad.nFileSizeLow;
+    unsigned long long mtime =
+        ((unsigned long long)fad.ftLastWriteTime.dwHighDateTime << 32) |
+        fad.ftLastWriteTime.dwLowDateTime;
+    return CacheHas(p, size, mtime);
+}
+
 static void WriteBytes(const std::wstring& path, const std::string& data) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -86,7 +98,11 @@ int main() {
         CHECK(st.failed == 1);         // c.docx
         CHECK(st.tooBig == 1);         // big.txt
         CHECK(!st.canceled && !st.quotaFull);
-        CHECK(CountCacheFiles() == 3);
+        CHECK(Cached(JoinPath(root, L"a.txt")));
+        CHECK(Cached(JoinPath(root, L"b.md")));
+        CHECK(Cached(JoinPath(root, L"sub\\e.csv")));
+        CHECK(!Cached(JoinPath(root, L"c.docx")));      // 解析失败的不该有缓存
+        CHECK(CacheUsedBytes() > 0);
     }
 
     printf("\n-- 2) 再跑一次：已有缓存应复用，不重复解析 --\n");
@@ -95,7 +111,8 @@ int main() {
         printf("  found=%d built=%d reused=%d\n", st.found, st.built, st.reused);
         CHECK(st.reused == 3);
         CHECK(st.built == 0);
-        CHECK(CountCacheFiles() == 3);
+        CHECK(Cached(JoinPath(root, L"a.txt")));
+        CHECK(Cached(JoinPath(root, L"sub\\e.csv")));
     }
 
     printf("\n-- 3) 只有不支持的文件：一个缓存都不该产生 --\n");

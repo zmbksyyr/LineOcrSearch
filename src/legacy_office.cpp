@@ -238,6 +238,21 @@ bool ExtractDocText(Cfb& cfb, std::wstring& out) {
     unsigned flags = U16(&doc[0x0A]);
     if (flags & 0x0100) return false;                 // 加密
 
+    // 压缩片段（每字符 1 字节）规范上按 cp1252 解释，但中文版 Word 生成的
+    // 文档里若出现双字节（部分第三方工具会这样写），按 cp1252 解会把一个字
+    // 拆成两个西欧字符，中文搜索必然落空。按 FIB 的 lid 选代码页更稳。
+    UINT cp = 1252;
+    {
+        unsigned lid = U16(&doc[0x06]);
+        switch (lid) {
+            case 0x0804: case 0x1004: cp = 936; break;   // 简中（大陆 / 新加坡）
+            case 0x0404: case 0x0C04: cp = 950; break;   // 繁中（台湾 / 香港）
+            case 0x0411: cp = 932; break;                // 日文
+            case 0x0412: cp = 949; break;                // 韩文
+            default: break;
+        }
+    }
+
     bool use1Table = (flags & 0x0200) != 0;
     unsigned ccpText = U32(&doc[0x4C]);
     if (ccpText == 0 || ccpText > 0x4000000u) return false;   // > 64M 字符：明显不对
@@ -291,16 +306,18 @@ bool ExtractDocText(Cfb& cfb, std::wstring& out) {
         if (compressed) fc /= 2;
 
         if (compressed) {
-            if ((unsigned long long)fc + take > doc.size()) return false;
-            std::string bytes((const char*)&doc[fc], take);
-            int need = MultiByteToWideChar(1252, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+            // 坏分片只跳过这一段，不整篇判死（末尾若一个字都没有才算失败）
+            if ((unsigned long long)fc + take > doc.size()) continue;
+            const char* bytes = (const char*)&doc[fc];
+            int need = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, bytes, (int)take, nullptr, 0);
+            if (need <= 0) need = MultiByteToWideChar(cp, 0, bytes, (int)take, nullptr, 0);
             if (need > 0) {
                 std::wstring w((size_t)need, L'\0');
-                MultiByteToWideChar(1252, 0, bytes.data(), (int)bytes.size(), &w[0], need);
+                MultiByteToWideChar(cp, 0, bytes, (int)take, &w[0], need);
                 AppendDocChars(w.c_str(), w.size(), out, fieldDepth);
             }
         } else {
-            if ((unsigned long long)fc + (unsigned long long)take * 2 > doc.size()) return false;
+            if ((unsigned long long)fc + (unsigned long long)take * 2 > doc.size()) continue;
             const wchar_t* w = (const wchar_t*)(&doc[fc]);
             AppendDocChars(w, take, out, fieldDepth);
         }
@@ -474,6 +491,10 @@ void FlushSheet(const std::wstring& name, XlsSheetText& sheet, std::wstring& out
         out += it->second;
     }
     out += L'\n';
+    // 超限不能静默：用户会以为「这个大表搜不到后面几万行」是程序坏了
+    if (sheet.full) {
+        out += L"【表格过大，已截断：仅前 20 万个单元格参与搜索】\n";
+    }
 }
 
 void PutCell(XlsSheetText& sheet, unsigned row, unsigned col, const std::wstring& text) {

@@ -351,6 +351,10 @@ static void AppendXmlTextRaw(std::wstring& out, const std::string& s) {
 }
 
 // docx：按 <w:p> 分段，取 <w:t> 文本
+// 单元格 <w:tc> 结束补一个 \t：否则一行三列会粘成「闭塞区段办理」，
+// 搜「区段办」会命中原文里根本没有的词
+// <w:delText>（修订模式下被删掉的文字）与 <w:t> 一样收进正文：
+// 用户想搜"修订前的说法"时要搜得到
 static void ExtractWordXml(const std::string& xml, std::wstring& out) {
     size_t p = 0;
     bool inT = false;
@@ -372,12 +376,25 @@ static void ExtractWordXml(const std::string& xml, std::wstring& out) {
         if (sp != std::string::npos) name = name.substr(0, sp);
         name = StripNs(name);
 
-        if (name == "t") {
+        if (name == "t" || name == "delText") {
             inT = !closing;
         } else if (name == "p") {
-            if (!out.empty() && out.back() != L'\n') out += L'\n';
+            // 只在 </w:p> 收尾：开标签也加的话，单元格首段会在 \t 后面再插一个 \n
+            if (closing) {
+                if (!out.empty() && out.back() == L'\t') out.pop_back();  // 行尾不留空列
+                if (!out.empty() && out.back() != L'\n') out += L'\n';
+            }
+        } else if (name == "tc") {
+            // 单元格内部的段落已经收过尾，把那个 \n 改成 \t，整行才算一行
+            if (closing && !out.empty()) {
+                if (out.back() == L'\n') out.back() = L'\t';
+                else if (out.back() != L'\t') out += L'\t';
+            }
         } else if (name == "tab") {
             out += L'\t';
+        } else if (name == "tr") {
+            // 一行结束：把最后一个列分隔符换成换行，否则表尾会和下一段粘成一行
+            if (closing && !out.empty() && out.back() == L'\t') out.back() = L'\n';
         } else if (name == "br" || name == "cr") {
             out += L'\n';
         }
@@ -412,6 +429,36 @@ static void ExtractSharedStrings(const std::string& xml, std::vector<std::wstrin
         }
         p = gt + 1;
     }
+}
+
+// 从标签文本里取属性值：支持 t="s" / t='s' / t = "s"，属性顺序任意。
+// 之前用 tag.find("t=\"s\"") 硬匹配字面量，换单引号或加空格就判不出共享字符串，
+// 结果把共享字符串索引当数字输出（本该是「闭塞」，界面上显示「37」）。
+static bool XmlAttr(const std::string& tag, const char* attr, std::string& out) {
+    auto isWs = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const size_t n = std::string(attr).size();
+    size_t p = 0;
+    while ((p = tag.find(attr, p)) != std::string::npos) {
+        bool okL = (p == 0) || isWs(tag[p - 1]);
+        size_t q = p + n;
+        bool okR = (q < tag.size()) && (isWs(tag[q]) || tag[q] == '=');
+        if (okL && okR) {
+            while (q < tag.size() && isWs(tag[q])) ++q;
+            if (q < tag.size() && tag[q] == '=') {
+                ++q;
+                while (q < tag.size() && isWs(tag[q])) ++q;
+                if (q < tag.size() && (tag[q] == '"' || tag[q] == '\'')) {
+                    char quote = tag[q++];
+                    size_t e = tag.find(quote, q);
+                    if (e == std::string::npos) return false;
+                    out.assign(tag, q, e - q);
+                    return true;
+                }
+            }
+        }
+        p += 1;
+    }
+    return false;
 }
 
 static void ExtractSheetXml(const std::string& xml, const std::vector<std::wstring>& shared,
@@ -458,9 +505,8 @@ static void ExtractSheetXml(const std::string& xml, const std::vector<std::wstri
 
         if (name == "c") {
             if (!closing) {
-                cellTypeShared = 0;
-                size_t tpos = tag.find("t=\"s\"");
-                if (tpos != std::string::npos) cellTypeShared = 1;
+                std::string tAttr;
+                cellTypeShared = (XmlAttr(tag, "t", tAttr) && tAttr == "s") ? 1 : 0;
                 cellText.clear();
                 inlineText.clear();
             } else {

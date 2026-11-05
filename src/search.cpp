@@ -49,6 +49,35 @@ static std::wstring NormalizeWidth(const std::wstring& s) {
     return t;
 }
 
+// 单字符折叠 = NormWidthChar + 大写，全程 1:1，位置不变。
+// 用它做行匹配，就不必为每一行先 NormalizeWidth 再 UpperW（8 万行 = 16 万次分配）。
+static inline wchar_t FoldChar(wchar_t c) {
+    c = NormWidthChar(c);
+    if (c < 0x80) {                                   // ASCII 快路：绝大多数命中的都是它
+        return (c >= L'a' && c <= L'z') ? (wchar_t)(c - 32) : c;
+    }
+    if (c >= 0x2E80) return c;                        // CJK / 假名 / 谚文等没有大小写
+    wchar_t b = c;
+    CharUpperBuffW(&b, 1);                            // 拉丁扩展 / 希腊 / 西里尔
+    return b;
+}
+
+// 在原始行里找已折叠的关键词：不分配，首字符对上了才逐字比
+static bool FindFolded(const std::wstring& line, const std::wstring& needle, size_t& at) {
+    const size_t n = line.size(), m = needle.size();
+    if (m == 0 || n < m) return false;
+    const wchar_t* lp = line.c_str();
+    const wchar_t* np = needle.c_str();
+    const wchar_t first = np[0];
+    for (size_t i = 0, last = n - m; i <= last; ++i) {
+        if (FoldChar(lp[i]) != first) continue;
+        size_t j = 1;
+        while (j < m && FoldChar(lp[i + j]) == np[j]) ++j;
+        if (j == m) { at = i; return true; }
+    }
+    return false;
+}
+
 static std::wstring LowerExt(const std::wstring& name) {
     size_t dot = name.find_last_of(L'.');
     if (dot == std::wstring::npos) return std::wstring();
@@ -241,14 +270,14 @@ void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const
     for (size_t i = 0; i < lines.size() && hits < kHitsPerFile; ++i) {
         if (collected >= kMaxCollect) { out->truncated = true; break; }
 
-        std::wstring lineUpper = UpperW(NormalizeWidth(lines[i]));
+        const std::wstring& line = lines[i];
 
         // 每个关键词都要在这一行出现（多关键词 AND）；任何一个找不到就跳过
         std::vector<HitSpan> found;
         bool all = true;
         for (size_t k = 0; k < kws.size(); ++k) {
-            size_t p = lineUpper.find(kws[k]);
-            if (p == std::wstring::npos) { all = false; break; }
+            size_t p = 0;
+            if (!FindFolded(line, kws[k], p)) { all = false; break; }
             HitSpan hs;
             hs.start = (int)p;
             hs.len = (int)kws[k].size();
