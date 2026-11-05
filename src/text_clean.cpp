@@ -151,22 +151,10 @@ std::wstring CleanOcrTextByX(const std::wstring& raw,
 
 // ---------------- 笔尖左锚点取词 ----------------
 
-static bool IsDigitKind(wchar_t c) {
-    if (c >= L'0' && c <= L'9') return true;
-    if (c >= 0xFF10 && c <= 0xFF19) return true;   // 全角数字
-    return false;
-}
-
-// 「2026年10月」这类前缀里的单位字：紧跟在数字后面时，它只是编号的一部分
-static bool IsUnitSuffix(wchar_t c) {
-    return c == L'年' || c == L'月' || c == L'日' || c == L'号' ||
-           c == L'时' || c == L'分' || c == L'秒' || c == L'点';
-}
-
 // 笔尖只是「从这里开始」的标记，不要求压在字上：
 //   1) 找笔尖右侧第一个文字字符（笔尖落在某个字内部时从该字算起）
-//   2) 截到行尾
-//   3) 两端去噪：空白 / 标点 / 符号 / 行首编号与日期前缀；中间原样保留
+//   2) 从它所在的纯文字段取到段尾（标点/括号/数字切段，英文词间空格不切）
+//   3) 段两端再去空白；中间原样保留
 std::wstring TakeRightOfCursor(const std::wstring& raw,
                                const std::vector<double>& charX, double mouseX,
                                size_t* outBegin, size_t* outEnd,
@@ -199,15 +187,22 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     std::wstring s = raw.substr(i0);
     if (s.empty()) return std::wstring();
 
-    size_t b = 0;
-    while (b < s.size()) {
-        if (!IsHardText(s[b])) { ++b; continue; }                        // 空白 / 数字 / 标点
-        if (b > 0 && IsUnitSuffix(s[b]) && IsDigitKind(s[b - 1])) { ++b; continue; }
-        break;
+    // 笔尖右侧的区域再按「非纯文字」切段（标点 / 括号 / 数字都是分隔符，
+    // 英文词间空格除外），取第一段有效文字：
+    //   「关于你问的「两端处理是不是误伤了」」-> 「关于你问的」；
+    //   「已处理 7m59s」-> 「已处理」；「Microsoft Edge (8)」-> 「Microsoft Edge」。
+    // 首段不足 2 个文字字符就顺延到下一段；一段都没有时兜底取首段。
+    std::vector<Seg> segs;
+    SplitSegments(s, segs);
+    if (segs.empty()) return std::wstring();
+
+    size_t b = segs[0].b, e = segs[0].e;
+    for (size_t k = 0; k < segs.size(); ++k) {
+        if (SegTextCount(s, segs[k]) >= 2) { b = segs[k].b; e = segs[k].e; break; }
     }
 
-    size_t e = s.size();
-    while (e > b && !IsHardText(s[e - 1])) --e;                          // 尾部标点 / 数字 / 空白
+    while (b < e && (s[b] == L' ' || s[b] == L'\t')) ++b;
+    while (e > b && (s[e - 1] == L' ' || s[e - 1] == L'\t')) --e;
 
     if (e <= b) return std::wstring();
     std::wstring out = s.substr(b, e - b);

@@ -88,31 +88,42 @@ static void TestTakeRight() {
     std::vector<double> xs;
     for (size_t i = 0; i < line.size(); ++i) xs.push_back(10.0 + 20.0 * (double)i);
 
-    Check(TakeRightOfCursor(line, xs, 0.0) ==
-              L"改为系统控件吧，这个也是丑陋，还不如用原生的好了",
-          "cursor left of line -> whole line, tail punctuation trimmed");
-    Check(TakeRightOfCursor(line, xs, 50.0) == L"系统控件吧，这个也是丑陋，还不如用原生的好了",
-          "cursor inside a char -> starts at that char");
-    Check(TakeRightOfCursor(line, xs, 150.0) == L"这个也是丑陋，还不如用原生的好了",
-          "cursor on comma -> left side dropped, right side kept in one piece");
+    // 锚点右侧区域要按标点切段，取第一段有效文字（不是整条尾巴）
+    Check(TakeRightOfCursor(line, xs, 0.0) == L"改为系统控件吧",
+          "cursor left of line -> first segment, tail punctuation dropped");
+    Check(TakeRightOfCursor(line, xs, 50.0) == L"系统控件吧",
+          "cursor inside a char -> that char's segment");
+    Check(TakeRightOfCursor(line, xs, 150.0) == L"这个也是丑陋",
+          "cursor on comma -> next segment, left side dropped");
     Check(TakeRightOfCursor(line, xs, 9000.0).empty(),
           "cursor right of all text -> empty, no guessing");
 
-    // 行首编号 / 装饰符被剥掉，正文里的标点原样保留（搜索要按原句命中）
+    // 用户实例：括号引用是分隔符，两侧各自成段
+    {
+        const std::wstring quote = L"关于你问的「两端处理是不是误伤了」";
+        std::vector<double> qx;
+        for (size_t i = 0; i < quote.size(); ++i) qx.push_back(10.0 + 20.0 * (double)i);
+        Check(TakeRightOfCursor(quote, qx, 0.0) == L"关于你问的",
+              "bracket quote -> left segment");
+        Check(TakeRightOfCursor(quote, qx, 110.0) == L"两端处理是不是误伤了",
+              "anchor inside quote -> inner segment");
+    }
+
+    // 行首编号 / 装饰符被剥掉（编号不是纯文字，切段时直接跳过）
     const std::wstring numbered = L"（3）总则：本办法适用于全线。";
     std::vector<double> nx;
     for (size_t i = 0; i < numbered.size(); ++i) nx.push_back(10.0 + 20.0 * (double)i);
-    Check(TakeRightOfCursor(numbered, nx, 0.0) == L"总则：本办法适用于全线",
-          "leading number + brackets cut, inner punctuation kept");
+    Check(TakeRightOfCursor(numbered, nx, 0.0) == L"总则",
+          "leading number + brackets cut; colon is a separator");
 
-    // 任务管理器那种「名字后面跟计数」的写法：两端剥掉，英文词间空格保留
+    // 任务管理器那种「名字后面跟计数」的写法：计数剥掉，英文词间空格保留
     const std::wstring proc = L"Microsoft Edge (8)";
     std::vector<double> px;
     for (size_t i = 0; i < proc.size(); ++i) px.push_back(10.0 + 9.0 * (double)i);
     Check(TakeRightOfCursor(proc, px, 0.0) == L"Microsoft Edge",
           "trailing counter cut, english space kept");
 
-    // 没有坐标表（UIA 只给了文字）：整段两端去噪
+    // 没有坐标表（UIA 只给了文字）：同样切段 + 两端去噪
     Check(TakeRightOfCursor(L"·【应收账款】·", std::vector<double>(), 0.0) == L"应收账款",
           "no positions -> trim both ends only");
 
