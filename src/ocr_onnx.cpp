@@ -8,6 +8,7 @@
 #include <cstring>
 #include <algorithm>
 #include <mutex>
+#include <atomic>
 
 // ---------------- ORT 全局状态 ----------------
 
@@ -22,7 +23,7 @@ static std::string          g_outName;
 static std::vector<std::wstring> g_dict;
 static std::wstring         g_info;
 static std::mutex           g_initMutex;
-static bool                 g_ready = false;
+static std::atomic<bool>    g_ready{ false };
 
 // ---------------- 小工具 ----------------
 

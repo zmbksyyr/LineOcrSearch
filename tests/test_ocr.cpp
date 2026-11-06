@@ -88,6 +88,11 @@ int main() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     EnablePerMonitorDpi();
 
+    // 锁屏/安全桌面下 BitBlt 截不到屏幕，测试应跳过而不是判失败。
+    HDESK desk = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
+    if (!desk) { printf("SKIP: 当前桌面不可截屏（锁屏/安全桌面）\n"); return 0; }
+    CloseDesktop(desk);
+
     if (!PrepareData()) {
         printf("SKIP: 数据目录缺少模型（res 下也没有）\n");
         return 0;
@@ -119,6 +124,7 @@ int main() {
     ClientToScreen(h, &org);
 
     int fails = 0;
+    int capFails = 0;
     const int probes[] = { 1, 2, 3 };   // 行 2/3/4
     const wchar_t* need[] = { L"车站值班员", L"行车组织工作", L"天窗或设备故障时" };
     for (int k = 0; k < 3; ++k) {
@@ -131,6 +137,7 @@ int main() {
         if (!CaptureBandRight(24, 800, 120, cap)) {
             printf("[probe %d] capture failed\n", k);
             ++fails;
+            ++capFails;
             continue;
         }
         std::wstring t;
@@ -152,6 +159,13 @@ int main() {
         if (seg.find(need[k]) == std::wstring::npos) ++fails;
     }
 
+    if (capFails == 3) {
+        printf("SKIP: 屏幕不可截（锁屏/安全桌面）\n");
+        OcrShutdown();
+        DestroyWindow(h);
+        CoUninitialize();
+        return 0;
+    }
     OcrShutdown();
     DestroyWindow(h);
     CoUninitialize();

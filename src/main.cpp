@@ -346,6 +346,12 @@ static void StartSearch(const std::wstring& keyword, bool fromCapture = false) {
         return;
     }
 
+    // 手动搜索是更强的用户意图：取消之前挂起的取词搜索，避免搜完又被覆盖。
+    if (!fromCapture) {
+        g_hasPendingSearch = false;
+        g_pendingKeyword.clear();
+    }
+
     SearchResultMsg* msg = new SearchResultMsg();
     msg->seq = ++g.seq;
     // 设置快照在主线程取：工作线程只读 msg->req
@@ -820,7 +826,7 @@ static void OnResults(SearchResultMsg* msg) {
         g.statusNote.clear();
 
         if (g.outcome.items.empty() && g.settings.backtrack && g_autoBacktrack &&
-            g_backtrackTries < kMaxBacktrack) {
+            g_backtrackTries < kMaxBacktrack && !g_hasPendingSearch) {
             const std::wstring& kw = g.outcome.keyword;
             std::wstring cand = kw;
             while (!cand.empty() && !iswalnum(cand.back()) && CountTextChars(cand) > 2) {
