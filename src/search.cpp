@@ -150,7 +150,21 @@ static bool IsSkippedDir(const std::wstring& name) {
     return false;
 }
 
-// 编码探测：BOM → UTF-8 严格 → 系统 ANSI（中文系统为 GBK）
+// 单代码页解码；失败（代码页未安装/空）返回 false。
+static bool DecodeCodePage(const std::string& raw, UINT cp, std::wstring& out) {
+    out.clear();
+    if (raw.empty()) return true;
+    int n = MultiByteToWideChar(cp, 0, raw.data(), (int)raw.size(), nullptr, 0);
+    if (n <= 0) return false;
+    out.resize((size_t)n);
+    if (MultiByteToWideChar(cp, 0, raw.data(), (int)raw.size(), &out[0], n) <= 0) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// 编码探测：BOM → UTF-8 严格 → 系统 ANSI / GBK
 static bool DecodeBytes(const std::string& raw, std::wstring& out) {
     out.clear();
     if (raw.empty()) return true;
@@ -190,14 +204,23 @@ static bool DecodeBytes(const std::string& raw, std::wstring& out) {
         MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), (int)n, &out[0], wlen);
         return true;
     }
-    // 退回系统 ANSI 代码页（不假定区域：用 CP_ACP 而不是硬编码 936）
-    wlen = MultiByteToWideChar(CP_ACP, 0, raw.data(), (int)n, nullptr, 0);
-    if (wlen > 0) {
-        out.resize((size_t)wlen);
-        MultiByteToWideChar(CP_ACP, 0, raw.data(), (int)n, &out[0], wlen);
-        return true;
+    // 退回 ANSI；英文系统上 CP_ACP 是 1252，GBK 文档会变乱码，
+    // 所以再试一次 936，按解出的汉字数量选更可信的一个。
+    std::wstring ansi, gbk;
+    bool haveAnsi = DecodeCodePage(raw, CP_ACP, ansi);
+    bool haveGbk = (GetACP() != 936) && DecodeCodePage(raw, 936, gbk);
+    if (!haveAnsi && !haveGbk) return false;
+    if (haveAnsi && haveGbk) {
+        int ca = CountCjkChars(ansi);
+        int cg = CountCjkChars(gbk);
+        if (cg > ca && cg >= 2) out.swap(gbk);
+        else out.swap(ansi);
+    } else if (haveAnsi) {
+        out.swap(ansi);
+    } else {
+        out.swap(gbk);
     }
-    return false;
+    return true;
 }
 
 static void SplitLines(const std::wstring& text, std::vector<std::wstring>& lines) {
