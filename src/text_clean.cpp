@@ -82,10 +82,24 @@ static void SplitSegments(const std::wstring& raw, std::vector<Seg>& segs) {
     }
 }
 
+// 汉字：关键词只把汉字当作“文字”。英文字母/数字/标点都不算，
+// 否则一串英文会把纯文字段的字符数撑大，选出来全是英文。
+static bool IsCjkChar(wchar_t c) {
+    return (c >= 0x3400 && c <= 0x4DBF) ||   // 扩展 A
+           (c >= 0x4E00 && c <= 0x9FFF) ||   // 基本区
+           (c >= 0xF900 && c <= 0xFAFF);     // 兼容汉字
+}
+
 // 段内有效文字数（不含空格），不足 2 个的段不能当关键词
 static int SegTextCount(const std::wstring& raw, const Seg& s) {
     int n = 0;
     for (size_t i = s.b; i < s.e; ++i) if (IsHardText(raw[i])) ++n;
+    return n;
+}
+
+static int SegCjkCount(const std::wstring& raw, const Seg& s) {
+    int n = 0;
+    for (size_t i = s.b; i < s.e; ++i) if (IsCjkChar(raw[i])) ++n;
     return n;
 }
 
@@ -100,22 +114,39 @@ static std::wstring SegText(const std::wstring& raw, const Seg& s) {
     return seg;
 }
 
-// 没有鼠标位置：取最长的一段
+// 没有鼠标位置：优先选汉字最多的一段；整行没有汉字时才退回英文/数字段。
 std::wstring CleanOcrText(const std::wstring& raw) {
     if (raw.empty()) return std::wstring();
     std::vector<Seg> segs;
     SplitSegments(raw, segs);
 
-    size_t pick = 0;
-    size_t bestLen = 0;
-    bool found = false;
+    size_t pickCjk = 0, pickAny = 0;
+    int bestCjk = 0, bestAny = 0;
+    size_t lenCjk = 0, lenAny = 0;
+    bool foundCjk = false, foundAny = false;
+
     for (size_t k = 0; k < segs.size(); ++k) {
-        if (SegTextCount(raw, segs[k]) < 2) continue;
+        int cnt = SegTextCount(raw, segs[k]);
+        if (cnt < 2) continue;
         size_t len = segs[k].e - segs[k].b;
-        if (!found || len > bestLen) { bestLen = len; pick = k; found = true; }
+        int cjk = SegCjkCount(raw, segs[k]);
+        if (cjk >= 2) {
+            if (!foundCjk || cjk > bestCjk || (cjk == bestCjk && len > lenCjk)) {
+                foundCjk = true;
+                pickCjk = k;
+                bestCjk = cjk;
+                lenCjk = len;
+            }
+        } else if (!foundAny || cnt > bestAny || (cnt == bestAny && len > lenAny)) {
+            foundAny = true;
+            pickAny = k;
+            bestAny = cnt;
+            lenAny = len;
+        }
     }
-    if (!found) return std::wstring();
-    return SegText(raw, segs[pick]);
+    if (foundCjk) return SegText(raw, segs[pickCjk]);
+    if (foundAny) return SegText(raw, segs[pickAny]);
+    return std::wstring();
 }
 
 // 以鼠标右侧为准：取「包含鼠标、或位于鼠标右侧」的第一段；都在左侧时取最后一段。
@@ -188,7 +219,7 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     if (s.empty()) return std::wstring();
 
     // 笔尖右侧的区域按「非纯文字」切段（标点 / 括号 / 数字都是分隔符，
-    // 英文词间空格除外），取其中**最长的一段有效文字**：
+    // 英文词间空格除外），优先取汉字最多的一段；没有汉字才退回英文段：
     //   「关于你问的「两端处理是不是误伤了」」-> 「两端处理是不是误伤了」；
     //   「已处理 7m59s」-> 「已处理」；「Microsoft Edge (8)」-> 「Microsoft Edge」。
     // 用户明确要求「取一大块纯文字去搜索」：数字和标点 OCR 不准，干脆不要；
@@ -197,22 +228,31 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     SplitSegments(s, segs);
     if (segs.empty()) return std::wstring();
 
-    size_t best = 0;
-    bool found = false;
-    int bestCount = 0;
-    size_t bestLen = 0;
+    size_t pickCjk = 0, pickAny = 0;
+    int bestCjk = 0, bestAny = 0;
+    size_t lenCjk = 0, lenAny = 0;
+    bool foundCjk = false, foundAny = false;
     for (size_t k = 0; k < segs.size(); ++k) {
         int cnt = SegTextCount(s, segs[k]);
         if (cnt < 2) continue;
         size_t len = segs[k].e - segs[k].b;
-        if (!found || cnt > bestCount || (cnt == bestCount && len > bestLen)) {
-            found = true;
-            best = k;
-            bestCount = cnt;
-            bestLen = len;
+        int cjk = SegCjkCount(s, segs[k]);
+        if (cjk >= 2) {
+            if (!foundCjk || cjk > bestCjk || (cjk == bestCjk && len > lenCjk)) {
+                foundCjk = true;
+                pickCjk = k;
+                bestCjk = cjk;
+                lenCjk = len;
+            }
+        } else if (!foundAny || cnt > bestAny || (cnt == bestAny && len > lenAny)) {
+            foundAny = true;
+            pickAny = k;
+            bestAny = cnt;
+            lenAny = len;
         }
     }
-    if (!found) return std::wstring();
+    if (!foundCjk && !foundAny) return std::wstring();
+    size_t best = foundCjk ? pickCjk : pickAny;
 
     size_t b = segs[best].b, e = segs[best].e;
 

@@ -294,7 +294,8 @@ static bool UiaVisualLineAtPoint(POINT pt, std::wstring& outText, std::wstring& 
         para->ExpandToEnclosingUnit(TextUnit_Paragraph);
 
         std::vector<UiaGlyph> glyphs;
-        if (!CollectRangeGlyphs(para, glyphs, 3000)) {
+        // 长段落也只收前 6000 字；再长的段落退回 OCR，避免逐字 COM 调用拖死取词。
+        if (!CollectRangeGlyphs(para, glyphs, 6000)) {
             para->Release();
             r->Release();
             continue;

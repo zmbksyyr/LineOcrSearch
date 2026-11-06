@@ -54,8 +54,10 @@ static void TestClean() {
           "latin noise before CJK is split off");
     Check(CleanOcrText(L"本期 应收账款") == L"应收账款",
           "space between CJK splits segments");
-    Check(CleanOcrText(L"hello world 你好") == L"hello world",
-          "latin run and CJK run are separate");
+    Check(CleanOcrText(L"hello world 你好") == L"你好",
+          "CJK block wins over longer latin block");
+    Check(CleanOcrText(L"Windows 11 更新说明") == L"更新说明",
+          "mixed line selects CJK, not the longer English word");
 
     // 以鼠标右侧为准：给出每个字的水平位置，取「包含鼠标或位于鼠标右侧」的第一段
     // 排版假设：第 i 个字中心在 x = 10 + 20*i；句子共 26 字
@@ -122,6 +124,13 @@ static void TestTakeRight() {
     for (size_t i = 0; i < proc.size(); ++i) px.push_back(10.0 + 9.0 * (double)i);
     Check(TakeRightOfCursor(proc, px, 0.0) == L"Microsoft Edge",
           "trailing counter cut, english space kept");
+
+    // 英文比中文长时，仍优先选中文段；英文只作为没有汉字时的兜底
+    const std::wstring mixed = L"Windows 11 更新说明";
+    std::vector<double> mx2;
+    for (size_t i = 0; i < mixed.size(); ++i) mx2.push_back(10.0 + 12.0 * (double)i);
+    Check(TakeRightOfCursor(mixed, mx2, 0.0) == L"更新说明",
+          "mixed text: CJK block preferred over longer latin word");
 
     // 没有坐标表（UIA 只给了文字）：同样切段 + 两端去噪
     Check(TakeRightOfCursor(L"·【应收账款】·", std::vector<double>(), 0.0) == L"应收账款",
