@@ -89,6 +89,13 @@ int main() {
     EnablePerMonitorDpi();
 
     // 锁屏/安全桌面下 BitBlt 截不到屏幕，测试应跳过而不是判失败。
+    // GitHub Actions 的 Windows runner 在 session 0（无交互桌面）。
+    DWORD sessionId = 0;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == 0) {
+        printf("SKIP: session 0 没有交互桌面\n");
+        return 0;
+    }
+
     HDESK desk = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
     if (!desk) { printf("SKIP: 当前桌面不可截屏（锁屏/安全桌面）\n"); return 0; }
     CloseDesktop(desk);

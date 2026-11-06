@@ -1,0 +1,128 @@
+name: build
+
+# 推到主分支就出包，不用再去 Actions 页面点一下。手动触发也留着。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 连续推送只让最后一次真正出包；正在上传的那次必须跑完，
+# 半路掐断会在 Release 上留下半截的包。
+concurrency:
+  group: lineocrsearch-release-latest
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.0
+  RELEASE_TAG: latest
+  EXE_PATH: dist/LineOcrSearch.exe
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- 工具链 ----
+      - name: 安装 zig
+        shell: pwsh
+        run: |
+          $url = "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "zig.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP "zig")
+          $dir = (Get-ChildItem (Join-Path $env:RUNNER_TEMP "zig") -Directory | Select-Object -First 1).FullName
+          # GITHUB_PATH 只对后续 step 生效，当前 step 里要自己更新 PATH
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          $env:PATH = "$dir;$env:PATH"
+          zig version
+
+      # ---- 编译（build.bat 负责编译主程序、packer、内嵌资源）----
+      - name: 编译
+        shell: pwsh
+        run: |
+          cmd /c build.bat
+          if ($LASTEXITCODE -ne 0) { throw "编译失败（exit=$LASTEXITCODE）" }
+          if (!(Test-Path $env:EXE_PATH)) { throw "没有生成 $env:EXE_PATH" }
+
+          $f = Get-Item $env:EXE_PATH
+          if ($f.Length -lt 15MB) { throw "产物过小，资源可能没嵌入：$($f.Length) 字节" }
+          $h = (Get-FileHash $env:EXE_PATH -Algorithm SHA256).Hash
+          "产物 $($f.Name)  $($f.Length) 字节  sha256=$h"
+          "SIZE=$($f.Length)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---- 回归测试：9 套；OCR 截屏套件在 session 0/锁屏会自动 SKIP ----
+      - name: 测试
+        shell: pwsh
+        run: |
+          cmd /c tests\run_tests.bat
+          if ($LASTEXITCODE -ne 0) { throw "测试失败（exit=$LASTEXITCODE）" }
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LineOcrSearch-windows-x64
+          path: dist/LineOcrSearch.exe
+          if-no-files-found: error
+
+      # ---- 打包 ----
+      - name: 打包
+        shell: pwsh
+        run: |
+          $now  = [DateTime]::UtcNow
+          $cn   = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId($now, 'China Standard Time')
+          $date = $cn.ToString('yyyyMMdd')
+          $sha  = (git rev-parse --short=7 HEAD)
+          $name = "lineocrsearch-c-$date-$sha.zip"
+
+          if (Test-Path stage) { Remove-Item stage -Recurse -Force }
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item $env:EXE_PATH stage\LineOcrSearch.exe
+          Copy-Item README.md stage\
+          Compress-Archive -Path stage\* -DestinationPath $name -Force
+
+          $f = Get-Item $name
+          "包 $($f.Name)  $($f.Length) 字节"
+          "ASSET_NAME=$name"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "BUILD_STAMP=$date·$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---- 覆盖到唯一的 Release ----
+      - name: 清掉旧产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --title "Release" --notes "首次构建占位，随后被覆盖"
+            if ($LASTEXITCODE -ne 0) { throw "创建 Release 失败" }
+          }
+
+          $names = gh release view $env:RELEASE_TAG --json assets --jq '.assets[].name'
+          foreach ($n in $names) {
+            if ([string]::IsNullOrWhiteSpace($n)) { continue }
+            "删除旧产物：$n"
+            gh release delete-asset $env:RELEASE_TAG $n --yes
+            if ($LASTEXITCODE -ne 0) { throw "删除 $n 失败" }
+          }
+
+      - name: 上传新产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release upload $env:RELEASE_TAG $env:ASSET_NAME
+          if ($LASTEXITCODE -ne 0) { throw "上传失败" }
+
+          gh release edit $env:RELEASE_TAG `
+            --notes "构建于 $env:BUILD_STAMP · 提交 $env:GITHUB_SHA"
+          if ($LASTEXITCODE -ne 0) { throw "更新说明失败" }
+
+      - name: 结果
+        shell: pwsh
+        run: |
+          "产物：$env:ASSET_NAME （$env:SIZE 字节）"
+          "位置：https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
