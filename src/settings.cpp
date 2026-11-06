@@ -1,6 +1,7 @@
 // settings.cpp - 10 项大白话设置窗口（单页、无滚动、模态）
 #include "common.h"
 #include "theme.h"
+#include "app_state.h"
 #include "flatbutton.h"
 #include <shlobj.h>
 #include <objbase.h>
@@ -43,6 +44,7 @@ static HWND g_parent = nullptr;
 static Settings g_edit;
 static bool g_accepted = false;
 static RECT g_pathBox{};
+static int S(int v) { return theme::Scale(v); }
 
 static HFONT Font() { return theme::FontUI(); }
 static void SetCtlFont(HWND h) { SendMessageW(h, WM_SETFONT, (WPARAM)Font(), TRUE); }
@@ -271,6 +273,24 @@ static void PickFolder() {
     CoTaskMemFree(pidl);
 }
 
+static void ScaleDialogLayout(HWND h, int x, int y, int w, int hgt, double f) {
+    // 控件先按 96 DPI 的逻辑坐标创建，再统一缩放。
+    // f 同时受 DPI 与工作区高度约束：150% 笔记本上 774 逻辑高会超过屏幕，
+    // 这里宁可略小一点，也不让“确定”按钮跑到屏幕外。
+    auto SS = [f](int v) { return (int)((double)v * f + 0.5); };
+    for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        RECT r{};
+        GetWindowRect(c, &r);
+        MapWindowPoints(HWND_DESKTOP, h, (POINT*)&r, 2);
+        SetWindowPos(c, nullptr, SS((int)r.left), SS((int)r.top),
+                     SS((int)(r.right - r.left)), SS((int)(r.bottom - r.top)),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    g_pathBox = RECT{ SS((int)g_pathBox.left), SS((int)g_pathBox.top),
+                      SS((int)g_pathBox.right), SS((int)g_pathBox.bottom) };
+    SetWindowPos(h, nullptr, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static void CreateControls(HWND h) {
     const int x = 28;
     const int labelW = 500;
@@ -461,8 +481,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             DeleteObject(bg);
 
             RECT box = g_pathBox;
-            theme::FillRoundRect(dc, box, 7, theme::kCardBg);
-            theme::StrokeRoundRect(dc, box, 7, theme::kBorder);
+            theme::FillRoundRect(dc, box, S(7), theme::kCardBg);
+            theme::StrokeRoundRect(dc, box, S(7), theme::kBorder);
 
             EndPaint(h, &ps);
             return 0;
@@ -563,14 +583,25 @@ bool ShowSettingsDialog(HWND parent, Settings& s, const std::wstring& capNote) {
 
     RECT pr{};
     GetWindowRect(parent, &pr);
-    int w = 600, h = 774;
-    int x = pr.left + ((pr.right - pr.left) - w) / 2;
-    int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
+    const int w = 600, h = 774;          // 96 DPI 逻辑尺寸
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int workW = work.right - work.left;
+    int workH = work.bottom - work.top;
+    double f = (double)theme::Dpi() / 96.0;
+    if (workH > 80 && (double)(workH - 60) / (double)h < f) f = (double)(workH - 60) / (double)h;
+    if (workW > 80 && (double)(workW - 60) / (double)w < f) f = (double)(workW - 60) / (double)w;
+    if (f < 0.8) f = 0.8;
+    int sw = (int)((double)w * f + 0.5);
+    int sh = (int)((double)h * f + 0.5);
+    int x = pr.left + ((pr.right - pr.left) - sw) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - sh) / 2;
 
     g_dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LineOcrSettings", L"设置",
                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             x, y, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!g_dlg) return false;
+    ScaleDialogLayout(g_dlg, x, y, sw, sh, f);
 
     EnableWindow(parent, FALSE);
     ShowWindow(g_dlg, SW_SHOW);

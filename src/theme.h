@@ -20,11 +20,14 @@ const COLORREF kBtnDark   = RGB(45, 49, 56);
 const COLORREF kBtnDarkHi = RGB(66, 71, 80);
 const COLORREF kBtnLightHi = RGB(244, 245, 247);
 
-// 全局唯一字体：14px 常规字重
+// 全局唯一字体：14px 常规字重（按 DPI 缩放）
 HFONT FontUI();
 int   LineHeight();
 void  InitFonts();
 void  DoneFonts();
+void  SetDpi(int dpi);   // 改变 DPI 后自动重建字体
+int   Dpi();
+int   Scale(int v);      // 96 DPI 下的逻辑像素 -> 当前物理像素
 
 // 圆角填充矩形（不依赖 GDI+）
 void FillRoundRect(HDC dc, const RECT& r, int radius, COLORREF fill);

@@ -5,17 +5,15 @@
 #include <shellapi.h>
 #include <windowsx.h>
 
-static const int kCardGap = 8;
-static const int kCardPad = 12;
-static const int kSideMargin = 14;
-static const int kMoreH = 52;     // 底部「加载更多」条的高度
+static int S(int v) { return theme::Scale(v); }
+
 // ---------------- 结果列表 ----------------
 
 // 卡片里文字可用的宽度（跟随窗口宽度变化）
 static int ContentWidth() {
     RECT rc{};
     GetClientRect(g_hwndList, &rc);
-    int w = rc.right - 2 * kSideMargin - 2 * kCardPad;
+    int w = rc.right - 2 * S(14) - 2 * S(12);
     return w < 40 ? 40 : w;
 }
 
@@ -171,11 +169,11 @@ static int MeasureItem(HDC dc, const ResultItem& it, int maxW) {
     }
     SelectObject(dc, oldFont);
     if (lineCount < 1) lineCount = 1;
-    return kCardPad + g_lineH + 6 + lineCount * g_lineH + kCardPad + kCardGap;
+    return S(12) + g_lineH + 6 + lineCount * g_lineH + S(12) + S(8);
 }
 
 static int ItemH(size_t i) {
-    if (i >= g_itemH.size()) return kCardPad * 2 + g_lineH * 2 + kCardGap;
+    if (i >= g_itemH.size()) return S(12) * 2 + g_lineH * 2 + S(8);
     return g_itemH[i];
 }
 
@@ -189,6 +187,14 @@ void ListFlushPendingResize() {
     if (maxScroll < 0) maxScroll = 0;
     if (g.scrollY > maxScroll) g.scrollY = maxScroll;
     InvalidateRect(g_hwndList, nullptr, TRUE);
+}
+
+void ListResetMetrics() {
+    g_wrapW = -1;
+    g_wrapSeq = 0xFFFFFFFFu;
+    g_itemH.clear();
+    g_resizePending = false;
+    if (g_hwndList) RecalcTotalHeight();
 }
 
 void RecalcTotalHeight() {
@@ -220,7 +226,7 @@ void RecalcTotalHeight() {
 
     int h = 0;
     for (size_t i = 0; i < g_itemH.size(); ++i) h += g_itemH[i];
-    if (!g.outcome.pending.empty()) h += kMoreH;   // 底部「加载更多」条
+    if (!g.outcome.pending.empty()) h += S(52);   // 底部「加载更多」条
     g.totalH = h;
 
     // 窗口拉大 / 追加结果后，原来滚到底的位置可能越界
@@ -239,10 +245,10 @@ static bool MoreStripRect(RECT& out) {
     int top = 0;
     for (size_t i = 0; i < g.outcome.items.size(); ++i) top += ItemH(i);
     int sy = 10 + top - g.scrollY;
-    out.left   = kSideMargin;
-    out.right  = rc.right - kSideMargin;
+    out.left   = S(14);
+    out.right  = rc.right - S(14);
     out.top    = sy;
-    out.bottom = sy + kMoreH - kCardGap;
+    out.bottom = sy + S(52) - S(8);
     return true;
 }
 
@@ -270,18 +276,14 @@ static void BuildSegs(const ResultItem& it, bool hitLine, int len, std::vector<S
 }
 
 // ---------------- 自绘滚动条（可拖动）----------------
-static const int kScrollHitW = 16;   // 鼠标命中区宽度（比视觉更宽，好抓）
-static const int kThumbW     = 8;    // 滑块视觉宽度
-static const int kThumbMinH  = 44;   // 滑块最小高度（保证长文档下也好抓）
-static const int kTrackInset = 2;    // 轨道上下留白
 
 static bool g_dragScroll = false;    // 正在拖动滑块
 static int  g_dragGrabY  = 0;        // 按点相对滑块顶部的偏移
 
 static int ThumbHeight(const RECT& rc) {
     int barH = rc.bottom * rc.bottom / g.totalH;
-    if (barH < kThumbMinH) barH = kThumbMinH;
-    int maxBar = rc.bottom - kTrackInset * 2;
+    if (barH < S(44)) barH = S(44);
+    int maxBar = rc.bottom - S(2) * 2;
     if (barH > maxBar) barH = maxBar;
     return barH;
 }
@@ -290,12 +292,12 @@ static int ThumbHeight(const RECT& rc) {
 static bool ScrollThumbRect(const RECT& rc, RECT& thumb) {
     if (g.totalH <= 0 || g.totalH <= rc.bottom) return false;
     int barH   = ThumbHeight(rc);
-    int trackH = rc.bottom - kTrackInset * 2;
+    int trackH = rc.bottom - S(2) * 2;
     int maxScroll = g.totalH - rc.bottom;
     int barY = (trackH > barH && maxScroll > 0)
                    ? (trackH - barH) * g.scrollY / maxScroll : 0;
-    thumb = { rc.right - kThumbW - 3, kTrackInset + barY,
-              rc.right - 3, kTrackInset + barY + barH };
+    thumb = { rc.right - S(8) - 3, S(2) + barY,
+              rc.right - 3, S(2) + barY + barH };
     return true;
 }
 
@@ -305,9 +307,9 @@ static void ScrollToThumbY(HWND hwnd, int thumbTop) {
     GetClientRect(hwnd, &rc);
     if (g.totalH <= 0 || g.totalH <= rc.bottom) return;
     int barH   = ThumbHeight(rc);
-    int trackH = rc.bottom - kTrackInset * 2;
+    int trackH = rc.bottom - S(2) * 2;
     int maxScroll = g.totalH - rc.bottom;
-    int lo = kTrackInset, hi = kTrackInset + trackH - barH;
+    int lo = S(2), hi = S(2) + trackH - barH;
     int t = thumbTop - g_dragGrabY;
     if (t < lo) t = lo;
     if (t > hi) t = hi;
@@ -332,9 +334,9 @@ static void PaintList(HWND hwnd) {
     FillRect(mem, &rc, pageBg);
     DeleteObject(pageBg);
 
-    int cardLeft = kSideMargin;
-    int cardRight = rc.right - kSideMargin;
-    int maxW = cardRight - cardLeft - kCardPad * 2;
+    int cardLeft = S(14);
+    int cardRight = rc.right - S(14);
+    int maxW = cardRight - cardLeft - S(12) * 2;
     if (maxW < 40) maxW = 40;
     int y = 10 - g.scrollY;
 
@@ -344,15 +346,15 @@ static void PaintList(HWND hwnd) {
         if (y + ih < 0) { y += ih; continue; }
         if (y > rc.bottom) break;
 
-        RECT card{ cardLeft, y, cardRight, y + ih - kCardGap };
+        RECT card{ cardLeft, y, cardRight, y + ih - S(8) };
         bool sel = ((int)i == g.selected);
 
         theme::FillRoundRect(mem, card, 8, sel ? theme::kSelBg : theme::kCardBg);
         theme::StrokeRoundRect(mem, card, 8, sel ? theme::kBorderStrong : theme::kBorder);
 
-        int tx = card.left + kCardPad;
-        int maxRight = card.right - kCardPad;
-        int ty = card.top + kCardPad;
+        int tx = card.left + S(12);
+        int maxRight = card.right - S(12);
+        int ty = card.top + S(12);
 
         // 标题：文件名超长时省略，行号只在右侧还有空间时显示
         HGDIOBJ oldFont = SelectObject(mem, theme::FontUI());
@@ -401,7 +403,7 @@ static void PaintList(HWND hwnd) {
         int top = 0;
         for (size_t i = 0; i < g.outcome.items.size(); ++i) top += ItemH(i);
         int sy = 10 + top - g.scrollY;
-        RECT strip{ cardLeft, sy, cardRight, sy + kMoreH - kCardGap };
+        RECT strip{ cardLeft, sy, cardRight, sy + S(52) - S(8) };
         if (strip.bottom > 0 && strip.top < rc.bottom) {
             theme::FillRoundRect(mem, strip, 8, theme::kCardBg);
             theme::StrokeRoundRect(mem, strip, 8, theme::kBorder);
@@ -411,7 +413,7 @@ static void PaintList(HWND hwnd) {
             SIZE sz{};
             GetTextExtentPoint32W(mem, tip.c_str(), (int)tip.size(), &sz);
             int cx = strip.left + (strip.right - strip.left - sz.cx) / 2;
-            if (cx < strip.left + kCardPad) cx = strip.left + kCardPad;
+            if (cx < strip.left + S(12)) cx = strip.left + S(12);
             SetTextColor(mem, theme::kTextSub);
             TextOutW(mem, cx, strip.top + (strip.bottom - strip.top - g_lineH) / 2,
                      tip.c_str(), (int)tip.size());
@@ -511,7 +513,7 @@ static int HitTestItem(int clientY) {
     int top = 0;
     for (size_t i = 0; i < g.outcome.items.size(); ++i) {
         int ih = ItemH(i);
-        if (y >= top && y < top + ih - kCardGap) return (int)i;
+        if (y >= top && y < top + ih - S(8)) return (int)i;
         top += ih;
     }
     return -1;
@@ -657,7 +659,7 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetClientRect(hwnd, &rc);
 
             // 滚动条区：按下滑块开始拖；按在轨道上则把滑块中心跟过去再拖
-            if (mx >= rc.right - kScrollHitW) {
+            if (mx >= rc.right - S(16)) {
                 RECT thumb{};
                 if (ScrollThumbRect(rc, thumb)) {
                     SetCapture(hwnd);
@@ -687,7 +689,7 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.selected = -1;
             for (size_t i = 0; i < g.outcome.items.size(); ++i) {
                 int ih = ItemH(i);
-                if (myInDoc >= y && myInDoc < y + ih - kCardGap) { g.selected = (int)i; break; }
+                if (myInDoc >= y && myInDoc < y + ih - S(8)) { g.selected = (int)i; break; }
                 y += ih;
             }
             SetFocus(hwnd);          // 点卡片即接管焦点，↑↓/Enter/Ctrl+C 才能用
@@ -700,7 +702,7 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc{};
             GetClientRect(hwnd, &rc);
             int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-            if (mx < rc.right - kScrollHitW) {
+            if (mx < rc.right - S(16)) {
                 int idx = HitTestItem(my);
                 if (idx >= 0) {
                     g.selected = idx;
@@ -723,7 +725,7 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 POINT cp = pt;
                 ScreenToClient(hwnd, &cp);
-                if (cp.x >= rc.right - kScrollHitW) return 0;   // 滚动条上不弹卡片菜单
+                if (cp.x >= rc.right - S(16)) return 0;   // 滚动条上不弹卡片菜单
                 idx = HitTestItem(cp.y);
             }
             if (idx < 0) return 0;
@@ -750,12 +752,12 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDBLCLK: {
             RECT rc{};
             GetClientRect(hwnd, &rc);
-            if (GET_X_LPARAM(lp) >= rc.right - kScrollHitW) return 0;   // 滚动条区域不当作卡片
+            if (GET_X_LPARAM(lp) >= rc.right - S(16)) return 0;   // 滚动条区域不当作卡片
             int my = GET_Y_LPARAM(lp) + g.scrollY - 10;
             int y = 0;
             for (size_t i = 0; i < g.outcome.items.size(); ++i) {
                 int ih = ItemH(i);
-                if (my >= y && my < y + ih - kCardGap) { OpenItem((int)i); break; }
+                if (my >= y && my < y + ih - S(8)) { OpenItem((int)i); break; }
                 y += ih;
             }
             return 0;

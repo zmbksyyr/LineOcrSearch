@@ -27,6 +27,7 @@ void SetLeftStatus(const std::wstring& s);
 // 结果列表（listview.cpp 实现）
 void RecalcTotalHeight();   // 结果变化或窗口宽度变化后重算折行与总高度
 void ListFlushPendingResize();  // 拖动窗口结束时，把延迟的重测算掉
+void ListResetMetrics();        // DPI 变化后强制所有卡片重新测量
 void ShowMoreResults();     // 把暂存的命中追加一批到列表（「加载更多」）
 void EnsureItemVisible(int index);
 void CopyResultToClipboard(const ResultItem& it);

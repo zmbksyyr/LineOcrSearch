@@ -25,6 +25,7 @@ static HWND g_hwndBtnSet = nullptr;
 static bool   g_richOk = false;            // 输入框是否用了 RichEdit（支持局部变色）
 static bool   g_editSilent = false;        // 程序自己在改内容时忽略 EN_CHANGE
 static size_t g_dimFrom = (size_t)-1;      // 输入框里从第几个字开始是「被缩短掉的」，grey
+static size_t g_usedStart = 0;             // 实际搜索词在输入框里的起点
 
 static std::wstring g_bundleNote;   // 首次启动释放内嵌资源的说明
 static std::wstring g_statusLeft;   // 取词状态 / 倒计时
@@ -39,6 +40,28 @@ static const int kStatusH = 30;
 static const int kCardGap = 8;
 static const int kCardPad = 12;
 static const int kSideMargin = 14;
+
+static int S(int v) { return theme::Scale(v); }
+
+// Win10 1607+ 的 GetDpiForWindow 动态取；Win7 退回系统 DPI。
+static int DpiForWindowCompat(HWND hwnd) {
+    typedef UINT(WINAPI* GetDpiForWindowFn)(HWND);
+    static GetDpiForWindowFn fn = nullptr;
+    static bool loaded = false;
+    if (!loaded) {
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        if (u) fn = (GetDpiForWindowFn)GetProcAddress(u, "GetDpiForWindow");
+        loaded = true;
+    }
+    if (fn && hwnd) {
+        UINT d = fn(hwnd);
+        if (d) return (int)d;
+    }
+    HDC dc = GetDC(hwnd);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+    if (dc) ReleaseDC(hwnd, dc);
+    return dpi > 0 ? dpi : 96;
+}
 
 struct SearchResultMsg {
     unsigned seq;
@@ -216,12 +239,19 @@ static void EditPaintColors(bool keepCaret) {
     cf.crTextColor = theme::kTextMain;
     SendMessageW(g_hwndEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
 
-    if (g_dimFrom < (size_t)n) {
-        CHARRANGE dim{ (LONG)g_dimFrom, -1 };
+    // 灰色 = 没参与搜索的部分。搜索词通常是 OCR 行中间的一段，
+    // 所以起点之前、终点之后都要置灰。
+    auto dimRange = [&](size_t b, size_t e) {
+        if (b >= (size_t)n || e <= b) return;
+        if (e > (size_t)n) e = (size_t)n;
+        CHARRANGE dim{ (LONG)b, (LONG)e };
         SendMessageW(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&dim);
         cf.crTextColor = theme::kTextFaint;
         SendMessageW(g_hwndEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-    }
+    };
+    size_t usedEnd = (g_dimFrom < (size_t)n) ? g_dimFrom : (size_t)n;
+    if (g_usedStart > 0) dimRange(0, g_usedStart);
+    if (usedEnd < (size_t)n) dimRange(usedEnd, (size_t)n);
 
     if (keepCaret) {
         SendMessageW(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&save);
@@ -232,9 +262,18 @@ static void EditPaintColors(bool keepCaret) {
     g_editSilent = wasSilent;
 }
 
-// 程序写入整段文字：整段都是「实际搜索用到的」
+static std::wstring SingleLineForEdit(const std::wstring& s) {
+    std::wstring t = s;
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (t[i] == L'\r' || t[i] == L'\n' || t[i] == L'\t') t[i] = L' ';
+    }
+    return t;
+}
+
+// 程序写入一段文字：默认整段都是「实际搜索用到的」
 static void EditSetText(const std::wstring& text) {
     if (!g_hwndEdit) return;
+    g_usedStart = 0;
     g_dimFrom = (size_t)-1;
     g_editSilent = true;
     SetWindowTextW(g_hwndEdit, text.c_str());
@@ -243,11 +282,31 @@ static void EditSetText(const std::wstring& text) {
     InvalidateRect(g_hwndEdit, nullptr, TRUE);
 }
 
-// 文字不动，只把「前 used 个字」当作用中的，其余置灰（自动缩短关键词时用）
+// 整段文字保留，只把 [start, start+len) 当作用中的，前后置灰。
+// 这样能同时看到 OCR 原文、纯文字段、实际搜索词。
+static void EditSetUsedRange(size_t start, size_t len) {
+    if (!g_hwndEdit) return;
+    size_t n = (size_t)GetWindowTextLengthW(g_hwndEdit);
+    if (start > n) start = n;
+    size_t end = start + len;
+    if (end > n) end = n;
+    g_usedStart = start;
+    g_dimFrom = (end >= n) ? (size_t)-1 : end;
+    if (g_richOk) {
+        EditPaintColors(false);
+        InvalidateRect(g_hwndEdit, nullptr, TRUE);
+    }
+}
+
+// 文字不动，只把「从搜索起点开始的 used 个字」当作用中的（自动缩短关键词时用）
 static void EditSetUsed(size_t used) {
     if (!g_hwndEdit) return;
     size_t n = (size_t)GetWindowTextLengthW(g_hwndEdit);
-    g_dimFrom = (used >= n) ? (size_t)-1 : used;
+    size_t start = (g_usedStart <= n) ? g_usedStart : 0;
+    size_t end = start + used;
+    if (end > n) end = n;
+    g_usedStart = start;
+    g_dimFrom = (end >= n) ? (size_t)-1 : end;
     if (g_richOk) {
         EditPaintColors(false);
         InvalidateRect(g_hwndEdit, nullptr, TRUE);
@@ -422,7 +481,7 @@ static void MaskOwnWindow(CapturedBgra& cap) {
 
     // 只涂“这一块像素确实属于本程序窗口”的小格。
     // 如果本程序窗口在目标窗口后面，条带里看到的是目标文字，涂了就把目标擦掉了。
-    const int kCell = 24;
+    const int kCell = S(24);
     DWORD myPid = GetCurrentProcessId();
     for (int yy = y0; yy < y1; yy += kCell) {
         int ey = yy + kCell; if (ey > y1) ey = y1;
@@ -690,10 +749,16 @@ static void OnCaptureDone(CaptureResultMsg* msg) {
     g_attemptsAtPoint = 0;   // 取到了，重点位的重试计数归零
 
     g.lastOcrRaw = msg->raw;
+    size_t blockBegin = 0, blockEnd = 0;
     std::wstring clean = (msg->haveX && msg->charX.size() == msg->raw.size())
-        ? TakeRightOfCursor(msg->raw, msg->charX, msg->mouseX)
-        : TakeRightOfCursor(msg->raw, std::vector<double>(), 0.0);
-    if (clean.empty() && !msg->raw.empty()) clean = CleanOcrText(msg->raw);   // 兜底：至少别空手
+        ? TakeRightOfCursor(msg->raw, msg->charX, msg->mouseX, &blockBegin, &blockEnd)
+        : TakeRightOfCursor(msg->raw, std::vector<double>(), 0.0, &blockBegin, &blockEnd);
+    if (clean.empty() && !msg->raw.empty()) {
+        clean = CleanOcrText(msg->raw);   // 兜底：至少别空手
+        size_t at = msg->raw.find(clean);
+        blockBegin = (at == std::wstring::npos) ? 0 : at;
+        blockEnd = blockBegin + clean.size();
+    }
     std::wstring note = L"已取词 · " + msg->src;
     if (msg->alignPct >= 0) note += L" · 与 UIA 重合 " + std::to_wstring(msg->alignPct) + L"%";
     if (msg->estimated) note += L" · 位置为估算";
@@ -706,7 +771,12 @@ static void OnCaptureDone(CaptureResultMsg* msg) {
     g_lastCaptured = clean;
     g_lastCapturedRoot = g.settings.rootDir;
 
-    EditSetText(clean);
+    // 输入框显示 OCR/UIA 取到的整行原文；只有实际参与搜索的那一段是深色，
+    // 前后不参与的部分用原有置灰逻辑标出来。
+    EditSetText(SingleLineForEdit(msg->raw));
+    if (blockEnd > blockBegin && blockBegin < msg->raw.size()) {
+        EditSetUsedRange(blockBegin, blockEnd - blockBegin);
+    }
     if (g.settings.autoSearch) StartSearch(clean, true);
     delete msg;
 }
@@ -873,37 +943,38 @@ static void Layout(HWND hwnd) {
     RECT rc{};
     GetClientRect(hwnd, &rc);
 
-    int margin = 16;
-    int btnW = 78;
-    int btnH = 32;
-    int gap = 8;
-    int inputH = 32;
+    int margin = S(16);
+    int btnW = S(78);
+    int btnH = S(32);
+    int gap = S(8);
+    int inputH = S(32);
     int inputRight = rc.right - margin - btnW * 2 - gap * 2;
     int inputW = inputRight - margin;
-    if (inputW < 80) inputW = 80;
+    if (inputW < S(80)) inputW = S(80);
 
     g_inputRect.left = margin;
-    g_inputRect.top = (kTopBarH - inputH) / 2;
+    g_inputRect.top = (S(kTopBarH) - inputH) / 2;
     g_inputRect.right = margin + inputW;
     g_inputRect.bottom = g_inputRect.top + inputH;
 
-    int editInset = 11;
+    int editInset = S(11);
+    int editH = S(22);
     MoveWindow(g_hwndEdit,
                g_inputRect.left + editInset,
-               g_inputRect.top + (inputH - 22) / 2,
-               inputW - editInset * 2, 22, TRUE);
+               g_inputRect.top + (inputH - editH) / 2,
+               inputW - editInset * 2, editH, TRUE);
 
-    MoveWindow(g_hwndBtnSearch, inputRight + gap, (kTopBarH - btnH) / 2, btnW, btnH, TRUE);
-    MoveWindow(g_hwndBtnSet, inputRight + gap + btnW + gap, (kTopBarH - btnH) / 2, btnW, btnH, TRUE);
+    MoveWindow(g_hwndBtnSearch, inputRight + gap, (S(kTopBarH) - btnH) / 2, btnW, btnH, TRUE);
+    MoveWindow(g_hwndBtnSet, inputRight + gap + btnW + gap, (S(kTopBarH) - btnH) / 2, btnW, btnH, TRUE);
 
-    int listH = rc.bottom - kTopBarH - kStatusH;
+    int listH = rc.bottom - S(kTopBarH) - S(kStatusH);
     if (listH < 0) listH = 0;
-    MoveWindow(g_hwndList, 0, kTopBarH, rc.right, listH, TRUE);
+    MoveWindow(g_hwndList, 0, S(kTopBarH), rc.right, listH, TRUE);
 
     g_statusRect.left = 0;
     g_statusRect.right = rc.right;
     g_statusRect.bottom = rc.bottom;
-    g_statusRect.top = rc.bottom - kStatusH;
+    g_statusRect.top = rc.bottom - S(kStatusH);
 }
 
 // ---------------- 主窗口绘制 ----------------
@@ -922,8 +993,8 @@ static void PaintMain(HWND hwnd) {
 
     // 输入框外框（EDIT 本身无边框，画在它下面）
     RECT box = g_inputRect;
-    theme::FillRoundRect(dc, box, 7, theme::kCardBg);
-    theme::StrokeRoundRect(dc, box, 7, theme::kBorder);
+    theme::FillRoundRect(dc, box, S(7), theme::kCardBg);
+    theme::StrokeRoundRect(dc, box, S(7), theme::kBorder);
 
     // 状态栏分隔线
     RECT sr = g_statusRect;
@@ -936,11 +1007,11 @@ static void PaintMain(HWND hwnd) {
 
     HGDIOBJ oldFont = SelectObject(dc, theme::FontUI());
     SIZE sz{};
-    int textY = sr.top + (kStatusH - g_lineH) / 2;
+    int textY = sr.top + (S(kStatusH) - g_lineH) / 2;
 
     // 右段：命中统计
     GetTextExtentPoint32W(dc, g_statusRight.c_str(), (int)g_statusRight.size(), &sz);
-    int rx = sr.right - 16 - sz.cx;
+    int rx = sr.right - S(16) - sz.cx;
 
     // 左段：取词状态 / 倒计时 / 未设置提示
     std::wstring leftText = g_statusLeft;
@@ -948,24 +1019,24 @@ static void PaintMain(HWND hwnd) {
         leftText = L"未设置搜索文件夹（拖一个文件夹进来）";
     }
     SetTextColor(dc, theme::kTextMain);
-    RECT lc{ 16, sr.top, rx - 24, sr.bottom };
-    ExtTextOutW(dc, 16, textY, ETO_CLIPPED, &lc,
+    RECT lc{ S(16), sr.top, rx - S(24), sr.bottom };
+    ExtTextOutW(dc, S(16), textY, ETO_CLIPPED, &lc,
                 leftText.c_str(), (int)leftText.size(), nullptr);
     GetTextExtentPoint32W(dc, leftText.c_str(), (int)leftText.size(), &sz);
     int leftW = sz.cx;
 
     // 中段：取词方式 · 鼠标位置
-    int mx = 16 + leftW + 24;
-    if (mx < rx - 140) {
+    int mx = S(16) + leftW + S(24);
+    if (mx < rx - S(140)) {
         SetTextColor(dc, theme::kTextFaint);
-        RECT mc{ mx, sr.top, rx - 12, sr.bottom };
+        RECT mc{ mx, sr.top, rx - S(12), sr.bottom };
         ExtTextOutW(dc, mx, textY, ETO_CLIPPED, &mc,
                     g_statusMid.c_str(), (int)g_statusMid.size(), nullptr);
     }
 
     // 右段
     SetTextColor(dc, theme::kTextSub);
-    RECT rcl{ rx, sr.top, sr.right - 16, sr.bottom };
+    RECT rcl{ rx, sr.top, sr.right - S(16), sr.bottom };
     ExtTextOutW(dc, rx, textY, ETO_CLIPPED, &rcl,
                 g_statusRight.c_str(), (int)g_statusRight.size(), nullptr);
 
@@ -1007,6 +1078,7 @@ static void CreateControls(HWND hwnd) {
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
+            theme::SetDpi(DpiForWindowCompat(hwnd));
             theme::InitFonts();
             g_lineH = theme::LineHeight();
 
@@ -1038,6 +1110,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     : (g_bundleNote + L" · " + g.statusNote);
             }
             SetStatus();
+            return 0;
+        }
+        case WM_DPICHANGED: {
+            int dpi = HIWORD(wp);
+            if (dpi <= 0) dpi = DpiForWindowCompat(hwnd);
+            theme::SetDpi(dpi);
+            g_lineH = theme::LineHeight();
+            RECT* nr = (RECT*)lp;
+            SetWindowPos(hwnd, nullptr, nr->left, nr->top,
+                         nr->right - nr->left, nr->bottom - nr->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            if (g_hwndEdit) SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)theme::FontUI(), TRUE);
+            ListResetMetrics();
+            Layout(hwnd);
+            InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
         }
         case WM_ENTERSIZEMOVE:
@@ -1156,18 +1243,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int id = LOWORD(wp);
             if (id == IDC_EDIT && HIWORD(wp) == EN_CHANGE) {
                 // 用户自己改了内容：整段都算「实际在用」，取消置灰
-                if (!g_editSilent && g_dimFrom != (size_t)-1) {
+                if (!g_editSilent && (g_dimFrom != (size_t)-1 || g_usedStart != 0)) {
+                    g_usedStart = 0;
                     g_dimFrom = (size_t)-1;
                     EditPaintColors(true);
                 }
                 return 0;
             }
             if (id == IDC_BTN_SEARCH) {
-                std::wstring kw = EditText();
-                if (g_dimFrom != (size_t)-1) {   // 手动搜索 = 搜输入框里看到的整段
-                    g_dimFrom = (size_t)-1;
-                    EditPaintColors(false);
-                }
+                // 输入框现在显示 OCR 原文，只有中间一段是实际搜索词；
+                // 手动点搜索沿用这段，用户改过内容后范围会恢复成整段。
+                std::wstring all = EditText();
+                size_t n = all.size();
+                size_t b = (g_usedStart <= n) ? g_usedStart : 0;
+                size_t e = (g_dimFrom < n) ? g_dimFrom : n;
+                if (e < b) e = n;
+                std::wstring kw = all.substr(b, e - b);
+                if (kw.empty()) kw = all;
                 StartSearch(kw);
             } else if (id == IDC_BTN_SET) {
                 std::wstring note = L"当前可用：控件文字";
@@ -1257,8 +1349,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     lc.lpszClassName = L"LineOcrList";
     RegisterClassExW(&lc);
 
-    // 每次启动都用固定默认尺寸并居中，不记忆上次的窗口大小
-    const int kDefW = 920, kDefH = 660;
+    // 每次启动都用固定默认尺寸并居中，不记忆上次的窗口大小（按 DPI 缩放）
+    HDC sdc = GetDC(nullptr);
+    if (sdc) {
+        theme::SetDpi(GetDeviceCaps(sdc, LOGPIXELSY));
+        ReleaseDC(nullptr, sdc);
+    }
+    const int kDefW = S(920), kDefH = S(660);
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     if (work.right <= work.left || work.bottom <= work.top) {

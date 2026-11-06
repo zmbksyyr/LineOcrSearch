@@ -16,10 +16,13 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 
 namespace {
 
-// 后台搜索线程与设置窗口的“建立缓存”可能同时用缓存，公开入口统一串行化
+// 内存/索引用 CacheCs 保护；磁盘读写用 g_storeIo 串行化。
+// 两者不嵌套持有太久：磁盘 I/O 期间只拿 g_storeIo，不拿 CacheCs，
+// 这样建缓存写盘时，搜索线程仍能命中内存 LRU。
 CRITICAL_SECTION* CacheCs() {
     static CRITICAL_SECTION* cs = [] {
         CRITICAL_SECTION* p = new CRITICAL_SECTION();
@@ -35,6 +38,8 @@ struct CacheGuard {
     CacheGuard(const CacheGuard&) = delete;
     CacheGuard& operator=(const CacheGuard&) = delete;
 };
+
+std::mutex g_storeIo;   // 磁盘 store 的读/写/压缩都串行化，避免共用文件指针
 
 // ---------------- 内存 LRU ----------------
 
@@ -318,23 +323,7 @@ bool StoreReady() {
     return true;
 }
 
-bool StoreRead(const std::string& key, std::vector<std::wstring>& lines) {
-    std::unordered_map<std::string, StoredEntry>::iterator it = g_index.find(key);
-    if (it == g_index.end()) return false;
-    const StoredEntry& e = it->second;
-    if (e.bodyLen == 0) return false;
-    // 同一路径有更新的记录 -> 这条是旧版本，直接当未命中
-    std::unordered_map<std::string, unsigned>::iterator lit = g_latest.find(PathOfKey(key));
-    if (lit != g_latest.end() && lit->second != e.seq) return false;
-
-    std::string body;
-    body.resize(e.bodyLen);
-    if (!ReadAt(e.off + kRecHdr + e.keyLen, &body[0], body.size())) {
-        // 记录读不出来（文件被外部改过）：丢弃这条索引，交给上层重建
-        g_index.erase(it);
-        return false;
-    }
-
+static void ParseBody(const std::string& body, std::vector<std::wstring>& lines) {
     lines.clear();
     size_t pos = 0;
     while (pos <= body.size()) {
@@ -346,40 +335,9 @@ bool StoreRead(const std::string& key, std::vector<std::wstring>& lines) {
         lines.push_back(FromUtf8(body.data() + pos, e2 - pos));
         pos = e2 + 1;
     }
-    return true;
 }
 
 void Compact(unsigned long long target);
-
-// 追加一条记录；配额超了就压缩
-void StoreWrite(const std::string& key, const std::string& body) {
-    if (body.empty()) return;
-
-    unsigned seq = ++g_storeSeq;
-
-    std::string rec;
-    rec.resize((size_t)kRecHdr + key.size() + body.size());
-    unsigned keyLen = (unsigned)key.size();
-    unsigned bodyLen = (unsigned)body.size();
-    memcpy(&rec[0], &keyLen, 4);
-    memcpy(&rec[4], &bodyLen, 4);
-    memcpy(&rec[8], &seq, 4);
-    memcpy(&rec[kRecHdr], key.data(), key.size());
-    memcpy(&rec[kRecHdr + key.size()], body.data(), body.size());
-
-    if (!WriteAt(g_storeEnd, rec.data(), rec.size())) return;  // 只读目录等情况：静默放弃
-
-    StoredEntry e;
-    e.off = g_storeEnd;
-    e.bodyLen = bodyLen;
-    e.keyLen = keyLen;
-    e.seq = seq;
-    g_index[key] = e;
-    g_latest[PathOfKey(key)] = seq;
-    g_storeEnd += rec.size();
-
-    if (g_batchDepth == 0 && g_storeEnd > MaxDiskBytes()) Compact(LowWaterBytes());
-}
 
 unsigned long long StoreBytesOnDisk() {
     WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -390,6 +348,7 @@ unsigned long long StoreBytesOnDisk() {
 // 压缩：按写入序号从旧到新丢，直到估算总量降到 target 以内；活着的记录按原顺序重写
 void Compact(unsigned long long target) {
     if (g_store == INVALID_HANDLE_VALUE) return;
+    CacheGuard g;
 
     // 只保留每条路径最新的那条：旧版本本来就读不到，顺手清掉
     std::vector<std::pair<unsigned, std::string> > order;
@@ -497,39 +456,74 @@ void CacheBeginBatch() {
 }
 
 void CacheEndBatch() {
-    CacheGuard g;
-    if (g_batchDepth > 0) --g_batchDepth;
-    if (g_batchDepth == 0 && g_storeEnd > MaxDiskBytes()) Compact(LowWaterBytes());
+    std::lock_guard<std::mutex> io(g_storeIo);
+    bool needCompact = false;
+    {
+        CacheGuard g;
+        if (g_batchDepth > 0) --g_batchDepth;
+        needCompact = (g_batchDepth == 0 && g_storeEnd > MaxDiskBytes());
+    }
+    if (needCompact) Compact(LowWaterBytes());
 }
 
 bool CacheGet(const std::wstring& path, unsigned size, unsigned long long mtime,
               std::vector<std::wstring>& lines) {
     std::string key = MakeKey(path, size, mtime);
 
-    CacheGuard g;
-    std::unordered_map<std::string, MemEntry>::iterator it = g_mem.find(key);
-    if (it != g_mem.end()) {
-        lines = it->second.lines;
-        TouchLru(key);
-        return true;
+    {
+        CacheGuard g;
+        std::unordered_map<std::string, MemEntry>::iterator it = g_mem.find(key);
+        if (it != g_mem.end()) {
+            lines = it->second.lines;
+            TouchLru(key);
+            return true;
+        }
     }
 
-    if (!StoreReady()) return false;
-    if (!StoreRead(key, lines)) return false;
+    // 索引/元数据在 CacheCs 内取；正文读取只拿 g_storeIo，不阻塞内存命中。
+    std::unique_lock<std::mutex> io(g_storeIo);
+    StoredEntry e;
+    {
+        CacheGuard g;
+        if (!StoreReady()) return false;
+        std::unordered_map<std::string, StoredEntry>::iterator it = g_index.find(key);
+        if (it == g_index.end() || it->second.bodyLen == 0) return false;
+        std::unordered_map<std::string, unsigned>::iterator lit = g_latest.find(PathOfKey(key));
+        if (lit != g_latest.end() && lit->second != it->second.seq) return false;
+        e = it->second;
+    }
+
+    std::string body;
+    body.resize(e.bodyLen);
+    if (!ReadAt(e.off + kRecHdr + e.keyLen, &body[0], body.size())) {
+        CacheGuard g;
+        std::unordered_map<std::string, StoredEntry>::iterator it = g_index.find(key);
+        if (it != g_index.end() && it->second.seq == e.seq) g_index.erase(it);
+        return false;
+    }
+    io.unlock();
+
+    ParseBody(body, lines);
+    CacheGuard g;
     MemStore(key, lines);
     return true;
 }
 
 bool CacheHas(const std::wstring& path, unsigned size, unsigned long long mtime) {
     std::string key = MakeKey(path, size, mtime);
+    {
+        CacheGuard g;
+        if (g_mem.find(key) != g_mem.end()) return true;
+    }
+    std::lock_guard<std::mutex> io(g_storeIo);
     CacheGuard g;
-    if (g_mem.find(key) != g_mem.end()) return true;
     if (!StoreReady()) return false;
     return g_index.find(key) != g_index.end();   // 纯内存判断，不再碰磁盘
 }
 
 // 清空内存缓存 + 删掉存储库与旧版遗留的缓存文件
 void CacheClearAll() {
+    std::lock_guard<std::mutex> io(g_storeIo);
     CacheGuard g;
     g_mem.clear();
     g_lru.clear();
@@ -563,8 +557,52 @@ void CachePut(const std::wstring& path, unsigned size, unsigned long long mtime,
         body += '\n';
     }
 
-    CacheGuard g;
-    MemStore(key, lines);
-    if (!StoreReady()) return;
-    StoreWrite(key, body);
+    {
+        CacheGuard g;
+        MemStore(key, lines);
+    }
+
+    unsigned keyLen = (unsigned)key.size();
+    unsigned bodyLen = (unsigned)body.size();
+    std::string rec;
+    rec.resize((size_t)kRecHdr + key.size() + body.size());
+    memcpy(&rec[0], &keyLen, 4);
+    memcpy(&rec[4], &bodyLen, 4);
+    memcpy(&rec[kRecHdr], key.data(), key.size());
+    memcpy(&rec[kRecHdr + key.size()], body.data(), body.size());
+
+    std::unique_lock<std::mutex> io(g_storeIo);
+    unsigned seq = 0;
+    unsigned long long off = 0;
+    bool needCompact = false;
+    {
+        CacheGuard g;
+        if (!StoreReady()) return;
+        seq = ++g_storeSeq;
+        memcpy(&rec[8], &seq, 4);
+        off = g_storeEnd;
+
+        StoredEntry e;
+        e.off = off;
+        e.bodyLen = bodyLen;
+        e.keyLen = keyLen;
+        e.seq = seq;
+        g_index[key] = e;
+        g_latest[PathOfKey(key)] = seq;
+        g_storeEnd += rec.size();
+        needCompact = (g_batchDepth == 0 && g_storeEnd > MaxDiskBytes());
+    }
+
+    if (!WriteAt(off, rec.data(), rec.size())) {
+        CacheGuard g;
+        std::unordered_map<std::string, StoredEntry>::iterator it = g_index.find(key);
+        if (it != g_index.end() && it->second.seq == seq) g_index.erase(it);
+        if (g_storeEnd == off + rec.size()) {
+            TruncateAt(off);
+            g_storeEnd = off;
+        }
+        return;
+    }
+
+    if (needCompact) Compact(LowWaterBytes());
 }

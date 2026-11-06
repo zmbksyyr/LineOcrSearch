@@ -4,10 +4,28 @@ namespace theme {
 
 static HFONT g_font = nullptr;
 static int   g_lineH = 20;
+static int   g_dpi = 96;
+
+int Dpi() { return g_dpi; }
+
+int Scale(int v) {
+    return MulDiv(v, g_dpi, 96);
+}
+
+void SetDpi(int dpi) {
+    if (dpi < 72) dpi = 72;
+    if (dpi > 384) dpi = 384;
+    if (dpi == g_dpi) return;
+    g_dpi = dpi;
+    if (g_font) {
+        DoneFonts();
+        InitFonts();
+    }
+}
 
 void InitFonts() {
     if (g_font) return;
-    g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    g_font = CreateFontW(-Scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
                          L"Microsoft YaHei UI");
@@ -15,7 +33,7 @@ void InitFonts() {
     HGDIOBJ old = SelectObject(dc, g_font);
     TEXTMETRICW tm{};
     GetTextMetricsW(dc, &tm);
-    g_lineH = tm.tmHeight + 4;
+    g_lineH = tm.tmHeight + Scale(4);
     SelectObject(dc, old);
     ReleaseDC(nullptr, dc);
 }
@@ -54,7 +72,7 @@ void DrawTextLine(HDC dc, int x, int y, const std::wstring& s, COLORREF color, i
     if (s.empty()) return;
     HGDIOBJ old = SelectObject(dc, g_font);
     SetTextColor(dc, color);
-    RECT clip{ x, y, maxRight, y + g_lineH + 4 };
+    RECT clip{ x, y, maxRight, y + g_lineH + Scale(4) };
     ExtTextOutW(dc, x, y, ETO_CLIPPED, &clip, s.c_str(), (int)s.size(), nullptr);
     SelectObject(dc, old);
 }
