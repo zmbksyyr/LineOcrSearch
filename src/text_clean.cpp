@@ -123,13 +123,14 @@ std::wstring CleanOcrText(const std::wstring& raw) {
     size_t pickCjk = 0, pickAny = 0;
     int bestCjk = 0, bestAny = 0;
     size_t lenCjk = 0, lenAny = 0;
-    bool foundCjk = false, foundAny = false;
+    bool foundCjk = false, foundAny = false, sawCjk = false;
 
     for (size_t k = 0; k < segs.size(); ++k) {
+        int cjk = SegCjkCount(raw, segs[k]);
+        if (cjk > 0) sawCjk = true;
         int cnt = SegTextCount(raw, segs[k]);
         if (cnt < 2) continue;
         size_t len = segs[k].e - segs[k].b;
-        int cjk = SegCjkCount(raw, segs[k]);
         if (cjk >= 2) {
             if (!foundCjk || cjk > bestCjk || (cjk == bestCjk && len > lenCjk)) {
                 foundCjk = true;
@@ -145,6 +146,7 @@ std::wstring CleanOcrText(const std::wstring& raw) {
         }
     }
     if (foundCjk) return SegText(raw, segs[pickCjk]);
+    if (sawCjk) return std::wstring();   // 有汉字但不足 2 个：不退回英文
     if (foundAny) return SegText(raw, segs[pickAny]);
     return std::wstring();
 }
@@ -231,12 +233,13 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
     size_t pickCjk = 0, pickAny = 0;
     int bestCjk = 0, bestAny = 0;
     size_t lenCjk = 0, lenAny = 0;
-    bool foundCjk = false, foundAny = false;
+    bool foundCjk = false, foundAny = false, sawCjk = false;
     for (size_t k = 0; k < segs.size(); ++k) {
+        int cjk = SegCjkCount(s, segs[k]);
+        if (cjk > 0) sawCjk = true;
         int cnt = SegTextCount(s, segs[k]);
         if (cnt < 2) continue;
         size_t len = segs[k].e - segs[k].b;
-        int cjk = SegCjkCount(s, segs[k]);
         if (cjk >= 2) {
             if (!foundCjk || cjk > bestCjk || (cjk == bestCjk && len > lenCjk)) {
                 foundCjk = true;
@@ -251,6 +254,7 @@ std::wstring TakeRightOfCursor(const std::wstring& raw,
             lenAny = len;
         }
     }
+    if (!foundCjk && sawCjk) return std::wstring();   // 有汉字但不足 2 个：不退回英文
     if (!foundCjk && !foundAny) return std::wstring();
     size_t best = foundCjk ? pickCjk : pickAny;
 

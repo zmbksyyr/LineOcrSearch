@@ -58,6 +58,8 @@ static void TestClean() {
           "CJK block wins over longer latin block");
     Check(CleanOcrText(L"Windows 11 更新说明") == L"更新说明",
           "mixed line selects CJK, not the longer English word");
+    Check(CleanOcrText(L"Windows 中").empty(),
+          "single CJK char does not fall back to the longer English word");
 
     // 以鼠标右侧为准：给出每个字的水平位置，取「包含鼠标或位于鼠标右侧」的第一段
     // 排版假设：第 i 个字中心在 x = 10 + 20*i；句子共 26 字
