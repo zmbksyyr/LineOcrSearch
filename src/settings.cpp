@@ -273,6 +273,22 @@ static void PickFolder() {
     CoTaskMemFree(pidl);
 }
 
+static double SettingsScale() {
+    const int logicalW = 600, logicalH = 774;
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int workW = work.right - work.left;
+    int workH = work.bottom - work.top;
+    double f = (double)theme::Dpi() / 96.0;
+    if (workH > 80 && (double)(workH - 60) / (double)logicalH < f) {
+        f = (double)(workH - 60) / (double)logicalH;
+    }
+    if (workW > 80 && (double)(workW - 60) / (double)logicalW < f) {
+        f = (double)(workW - 60) / (double)logicalW;
+    }
+    return f < 0.8 ? 0.8 : f;
+}
+
 static void ScaleDialogLayout(HWND h, int x, int y, int w, int hgt, double f) {
     // 控件先按 96 DPI 的逻辑坐标创建，再统一缩放。
     // f 同时受 DPI 与工作区高度约束：150% 笔记本上 774 逻辑高会超过屏幕，
@@ -464,8 +480,40 @@ static void CreateControls(HWND h) {
     }
 }
 
+static void RelayoutSettings(HWND h) {
+    if (!g_building) SaveFromControls();   // 先收下用户正在改的值
+
+    RECT wr{};
+    GetWindowRect(h, &wr);
+    int cx = (wr.left + wr.right) / 2;
+    int cy = (wr.top + wr.bottom) / 2;
+    const int w = 600, hgt = 774;
+    int x = cx - w / 2;
+    int y = cy - hgt / 2;
+
+    while (HWND c = GetWindow(h, GW_CHILD)) DestroyWindow(c);
+    SetWindowPos(h, nullptr, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE);
+    CreateControls(h);
+    LoadToControls(h);
+
+    double f = SettingsScale();
+    int sw = (int)((double)w * f + 0.5);
+    int sh = (int)((double)hgt * f + 0.5);
+    x = cx - sw / 2;
+    y = cy - sh / 2;
+    ScaleDialogLayout(h, x, y, sw, sh, f);
+    if (g_parent) PostMessageW(g_parent, WM_APP_DPI, 0, 0);
+    InvalidateRect(h, nullptr, TRUE);
+}
+
 static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
+        case WM_DPICHANGED: {
+            int dpi = HIWORD(wp);
+            if (dpi > 0) theme::SetDpi(dpi);
+            RelayoutSettings(h);
+            return 0;
+        }
         case WM_CREATE:
             CreateControls(h);
             LoadToControls(h);
@@ -584,14 +632,7 @@ bool ShowSettingsDialog(HWND parent, Settings& s, const std::wstring& capNote) {
     RECT pr{};
     GetWindowRect(parent, &pr);
     const int w = 600, h = 774;          // 96 DPI 逻辑尺寸
-    RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    int workW = work.right - work.left;
-    int workH = work.bottom - work.top;
-    double f = (double)theme::Dpi() / 96.0;
-    if (workH > 80 && (double)(workH - 60) / (double)h < f) f = (double)(workH - 60) / (double)h;
-    if (workW > 80 && (double)(workW - 60) / (double)w < f) f = (double)(workW - 60) / (double)w;
-    if (f < 0.8) f = 0.8;
+    double f = SettingsScale();
     int sw = (int)((double)w * f + 0.5);
     int sh = (int)((double)h * f + 0.5);
     int x = pr.left + ((pr.right - pr.left) - sw) / 2;

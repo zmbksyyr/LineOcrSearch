@@ -1331,6 +1331,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_CAPTURE:
             OnCaptureDone((CaptureResultMsg*)lp);
             return 0;
+        case WM_APP_DPI:
+            // 设置窗口里换了 DPI：字体已由 theme 重建，这里补主窗口的行高/布局。
+            g_lineH = theme::LineHeight();
+            if (g_hwndEdit) SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)theme::FontUI(), TRUE);
+            ListResetMetrics();
+            Layout(hwnd);
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
         case WM_APP_RESULTS:
             OnResults((SearchResultMsg*)lp);
             return 0;

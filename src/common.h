@@ -13,6 +13,7 @@
 #define WM_APP_RESULTS (WM_APP + 1)   // 后台搜索完成
 #define WM_APP_HINT    (WM_APP + 2)   // 状态栏提示更新
 #define WM_APP_CAPTURE (WM_APP + 3)   // 取词完成（后台线程）
+#define WM_APP_DPI     (WM_APP + 4)   // 设置窗口里改了 DPI，主窗口刷新布局
 
 // ---- 控件 ID ----
 #define IDC_EDIT      1001
