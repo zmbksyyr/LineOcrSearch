@@ -501,9 +501,8 @@ bool CacheGet(const std::wstring& path, unsigned size, unsigned long long mtime,
         if (it != g_index.end() && it->second.seq == e.seq) g_index.erase(it);
         return false;
     }
-    io.unlock();
-
     ParseBody(body, lines);
+    // 仍在 g_storeIo 内写回内存：避免读到的旧正文覆盖并发 CachePut 的新正文。
     CacheGuard g;
     MemStore(key, lines);
     return true;
