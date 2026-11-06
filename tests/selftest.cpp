@@ -33,11 +33,15 @@ static void WriteUtf8(const std::wstring& path, const std::wstring& text) {
     WriteFileBytes(path, out);
 }
 
-static void WriteGbk(const std::wstring& path, const std::wstring& text) {
+static bool WriteGbk(const std::wstring& path, const std::wstring& text) {
     int n = WideCharToMultiByte(936, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return false;
     std::string out((size_t)n, '\0');
-    WideCharToMultiByte(936, 0, text.c_str(), (int)text.size(), &out[0], n, nullptr, nullptr);
+    if (WideCharToMultiByte(936, 0, text.c_str(), (int)text.size(), &out[0], n, nullptr, nullptr) <= 0) {
+        return false;
+    }
     WriteFileBytes(path, out);
+    return true;
 }
 
 static void TestClean() {
@@ -179,8 +183,8 @@ static void TestSearch() {
 
     WriteUtf8(JoinPath(dir, L"a.txt"),
               L"第一行\n本期应收账款余额为 1,284,600 元\n第三行\n第四行\n第五行\n");
-    WriteGbk(JoinPath(dir, L"b.txt"),
-             L"标题\n这里含有测试关键词ABC\n结尾\n");
+    bool gbkOk = WriteGbk(JoinPath(dir, L"b.txt"),
+                          L"标题\n这里含有测试关键词ABC\n结尾\n");
     WriteUtf8(JoinPath(dir, L"skip.log"), L"no match here\n");
 
     SearchRequest req;
@@ -207,11 +211,15 @@ static void TestSearch() {
     req2.contextLevel = 0;
     req2.maxResults = 200;
     req2.searchOffice = false;
-    SearchOutcome o2 = RunSearch(req2);
-    Check(o2.items.size() == 1, "gbk file hit count = 1");
-    if (!o2.items.empty()) {
-        Check(o2.items[0].lineNo == 2, "gbk hit line = 2");
-        Check(o2.items[0].hitStart == 4, "gbk hit start = 4");
+    if (gbkOk) {
+        SearchOutcome o2 = RunSearch(req2);
+        Check(o2.items.size() == 1, "gbk file hit count = 1");
+        if (!o2.items.empty()) {
+            Check(o2.items[0].lineNo == 2, "gbk hit line = 2");
+            Check(o2.items[0].hitStart == 4, "gbk hit start = 4");
+        }
+    } else {
+        printf("  SKIP  GBK code page unavailable on this runner\n");
     }
 
     // 大小写不敏感
