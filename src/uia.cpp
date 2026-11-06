@@ -116,7 +116,7 @@ static bool FirstGlyphRect(IUIAutomationTextRange* r, RECT& rc) {
 
 // 把段落范围逐字走一遍，拿到每个码元的文字和屏幕矩形。
 static bool CollectRangeGlyphs(IUIAutomationTextRange* para, std::vector<UiaGlyph>& out,
-                               int maxChars) {
+                               int maxChars, int startOffset = 0) {
     out.clear();
     IUIAutomationTextRange* r = nullptr;
     if (FAILED(para->Clone(&r)) || !r) return false;
@@ -124,6 +124,23 @@ static bool CollectRangeGlyphs(IUIAutomationTextRange* para, std::vector<UiaGlyp
                                       TextPatternRangeEndpoint_Start))) {
         r->Release();
         return false;
+    }
+
+    // 长段落只收鼠标附近的一段：先把退化的范围移到 startOffset，
+    // 再从那里向后收集，避免从段落开头逐字走几千次 COM。
+    if (startOffset > 0) {
+        int movedToStart = 0;
+        if (FAILED(r->MoveEndpointByUnit(TextPatternRangeEndpoint_End,
+                                         TextUnit_Character, startOffset, &movedToStart)) ||
+            movedToStart == 0) {
+            r->Release();
+            return false;
+        }
+        if (FAILED(r->MoveEndpointByRange(TextPatternRangeEndpoint_Start, r,
+                                          TextPatternRangeEndpoint_End))) {
+            r->Release();
+            return false;
+        }
     }
 
     RECT last{};
@@ -232,6 +249,16 @@ static IUIAutomationTextRange* RangeNearPoint(IUIAutomationTextPattern* tp, POIN
     return nullptr;
 }
 
+static std::wstring RangeText(IUIAutomationTextRange* r, int maxChars) {
+    BSTR b = nullptr;
+    std::wstring s;
+    if (SUCCEEDED(r->GetText(maxChars, &b)) && b) {
+        s.assign(b, SysStringLen(b));
+        SysFreeString(b);
+    }
+    return s;
+}
+
 static bool UiaVisualLineAtPoint(POINT pt, std::wstring& outText, std::wstring& source,
                                  RECT* outRect, std::vector<double>* charX) {
     IUIAutomation* uia = GetUia();
@@ -293,9 +320,23 @@ static bool UiaVisualLineAtPoint(POINT pt, std::wstring& outText, std::wstring& 
         if (FAILED(r->Clone(&para)) || !para) { r->Release(); continue; }
         para->ExpandToEnclosingUnit(TextUnit_Paragraph);
 
+        // 计算“鼠标点”在段落里的字符偏移，只收它前后的一段。
+        // 否则超长段落会从段首逐字走几千次，鼠标那一行反而收不到。
+        int startOffset = 0;
+        {
+            IUIAutomationTextRange* prefix = nullptr;
+            if (SUCCEEDED(para->Clone(&prefix)) && prefix) {
+                if (SUCCEEDED(prefix->MoveEndpointByRange(TextPatternRangeEndpoint_End, r,
+                                                          TextPatternRangeEndpoint_Start))) {
+                    int offset = (int)RangeText(prefix, 200000).size();
+                    if (offset > 800) startOffset = offset - 800;
+                }
+                prefix->Release();
+            }
+        }
+
         std::vector<UiaGlyph> glyphs;
-        // 长段落也只收前 6000 字；再长的段落退回 OCR，避免逐字 COM 调用拖死取词。
-        if (!CollectRangeGlyphs(para, glyphs, 6000)) {
+        if (!CollectRangeGlyphs(para, glyphs, 6000, startOffset)) {
             para->Release();
             r->Release();
             continue;
