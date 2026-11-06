@@ -541,6 +541,8 @@ struct PickCandidate {
     int lineH = 20;
     int alignPct = -1;
     float confidence = -1.0f;
+    RECT rect{};            // 屏幕行框（用于 UIA/OCR 是否同一行的校验）
+    bool hasRect = false;
 };
 
 static bool MakeCandidate(const std::wstring& raw, const std::wstring& src,
@@ -587,7 +589,10 @@ static bool CaptureNativeCandidate(POINT p, PickCandidate& out) {
     }
     int h = rc.bottom - rc.top;
     if (h <= 0 || h > 60) h = 20;   // 多行控件的高度不是行高
-    return MakeCandidate(t, s, xs, (double)p.x, h, true, false, out);
+    if (!MakeCandidate(t, s, xs, (double)p.x, h, true, false, out)) return false;
+    out.rect = rc;
+    out.hasRect = (rc.right > rc.left && rc.bottom > rc.top);
+    return true;
 }
 
 static bool CaptureUiaCandidate(POINT p, PickCandidate& out) {
@@ -602,7 +607,10 @@ static bool CaptureUiaCandidate(POINT p, PickCandidate& out) {
     int h = rc.bottom - rc.top;
     if (h <= 0 || h > 200) h = 20;
     bool exact = (s == L"UIA 文字行");
-    return MakeCandidate(t, s, xs, (double)p.x, h, exact, !exact, out);
+    if (!MakeCandidate(t, s, xs, (double)p.x, h, exact, !exact, out)) return false;
+    out.rect = rc;
+    out.hasRect = (rc.right > rc.left && rc.bottom > rc.top);
+    return true;
 }
 
 static bool CaptureOcrCandidate(POINT p, PickCandidate& out, std::wstring& fail) {
@@ -638,6 +646,18 @@ static bool CaptureOcrCandidate(POINT p, PickCandidate& out, std::wstring& fail)
         return false;
     }
     out.confidence = confidence;
+    out.rect.left = p.x;
+    out.rect.right = p.x + 1;
+    out.rect.top = p.y - cap.mouseLocalY + lt;
+    out.rect.bottom = p.y - cap.mouseLocalY + lb;
+    out.hasRect = (lb > lt);
+
+    int cjk = CountCjkChars(out.block);
+    if (confidence < 0.18f || (confidence < 0.32f && cjk < 4)) {
+        fail = L"图片识别置信度太低（可能是图标或噪声）";
+        out = PickCandidate();
+        return false;
+    }
     return true;
 }
 
@@ -661,6 +681,8 @@ static bool AlignOcrToUia(POINT p, const PickCandidate& ocr, PickCandidate& out)
     if (!MakeCandidate(wt, L"智能 · 对齐", wx, ocr.mouseX, ocr.lineH, false, false, c)) return false;
     c.alignPct = (int)(ar.ratio * 100.0 + 0.5);
     c.confidence = ocr.confidence;
+    c.rect = ocr.rect;
+    c.hasRect = ocr.hasRect;
     out = c;
     return true;
 }
@@ -709,7 +731,21 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
         if (native.ok) {
             chosen = native;
         } else if (uia.ok && ocr.ok) {
-            if (uia.exact) {
+            bool sameLine = true;
+            if (uia.hasRect && ocr.hasRect) {
+                int top = (uia.rect.top > ocr.rect.top) ? uia.rect.top : ocr.rect.top;
+                int bottom = (uia.rect.bottom < ocr.rect.bottom) ? uia.rect.bottom : ocr.rect.bottom;
+                int ov = bottom - top;
+                int h1 = uia.rect.bottom - uia.rect.top;
+                int h2 = ocr.rect.bottom - ocr.rect.top;
+                int minH = (h1 < h2) ? h1 : h2;
+                sameLine = (ov > 0 && minH > 0 && ov * 2 >= minH);
+            }
+            if (!sameLine) {
+                // UIA 和 OCR 选中的不是同一视觉行：OCR 是像素行框，通常更可信；
+                // 只有 OCR 置信度很低时才退回 UIA。
+                chosen = (ocr.confidence >= 0.0f && ocr.confidence < 0.45f) ? uia : ocr;
+            } else if (uia.exact) {
                 double sim = TextSimilarityOrdered(uia.block, ocr.block);
                 bool ocrWeak = (ocr.confidence >= 0.0f && ocr.confidence < 0.50f);
                 chosen = (ocrWeak || sim >= 0.35 || CountTextChars(ocr.block) < 4) ? uia : ocr;

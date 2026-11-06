@@ -138,6 +138,7 @@ double TextSimilarity(const std::wstring& a, const std::wstring& b);
 // 它比 TextSimilarity 更能分清“同一句”与“只是用了同一批字”。
 double TextSimilarityOrdered(const std::wstring& a, const std::wstring& b);
 int          CountTextChars(const std::wstring& s);
+int          CountCjkChars(const std::wstring& s);
 
 // ---- 搜索（阻塞，调用方放后台线程）----
 SearchOutcome RunSearch(const SearchRequest& req);

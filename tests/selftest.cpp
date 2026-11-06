@@ -48,6 +48,7 @@ static void TestClean() {
     Check(CleanOcrText(L"·2026年10月账单…") == L"月账单", "digits ignored at head");
     Check(CleanOcrText(L"  【】||  ").empty(), "empty when no text char");
     Check(CountTextChars(L"1.我的142个") == 3, "count text chars ignores digits");
+    Check(CountCjkChars(L"Windows 更新") == 2, "cjk count ignores latin letters");
     Check(CleanOcrText(L"hello world") == L"hello world", "keeps inner space");
     // 空格只在两侧都是拉丁字母时才不断段：OCR 前缀噪声不会粘进关键词
     Check(CleanOcrText(L"Dekap 改为系统控件吧") == L"改为系统控件吧",

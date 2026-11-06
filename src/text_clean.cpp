@@ -347,3 +347,9 @@ int CountTextChars(const std::wstring& s) {
     for (size_t i = 0; i < s.size(); ++i) if (kind[i].text) ++n;
     return n;
 }
+
+int CountCjkChars(const std::wstring& s) {
+    int n = 0;
+    for (wchar_t c : s) if (IsCjkChar(c)) ++n;
+    return n;
+}
