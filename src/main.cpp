@@ -287,6 +287,15 @@ static void EditSetText(const std::wstring& text) {
     InvalidateRect(g_hwndEdit, nullptr, TRUE);
 }
 
+static void EditSetCaret(size_t pos) {
+    if (!g_richOk || !g_hwndEdit) return;
+    int n = GetWindowTextLengthW(g_hwndEdit);
+    if (pos > (size_t)n) pos = (size_t)n;
+    CHARRANGE cr{ (LONG)pos, (LONG)pos };
+    SendMessageW(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+    SendMessageW(g_hwndEdit, EM_SCROLLCARET, 0, 0);
+}
+
 // 整段文字保留，只把 [start, start+len) 当作用中的，前后置灰。
 // 这样能同时看到 OCR 原文、纯文字段、实际搜索词。
 static void EditSetUsedRange(size_t start, size_t len) {
@@ -299,6 +308,7 @@ static void EditSetUsedRange(size_t start, size_t len) {
     g_dimFrom = (end >= n) ? (size_t)-1 : end;
     if (g_richOk) {
         EditPaintColors(false);
+        EditSetCaret(end);   // 输入框很窄时，把视图滚到搜索词附近
         InvalidateRect(g_hwndEdit, nullptr, TRUE);
     }
 }
@@ -314,6 +324,7 @@ static void EditSetUsed(size_t used) {
     g_dimFrom = (end >= n) ? (size_t)-1 : end;
     if (g_richOk) {
         EditPaintColors(false);
+        EditSetCaret(end);
         InvalidateRect(g_hwndEdit, nullptr, TRUE);
     }
 }
