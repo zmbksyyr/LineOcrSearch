@@ -238,7 +238,9 @@ static bool OtsuInRect(const std::vector<unsigned char>& gray, int w,
     long long below = 0;
     for (int i = 0; i <= bestT; ++i) below += hist[i];
     long long above = total - below;
-    if (below < total / 100 || above < total / 100) return false;
+    // 只要两类都确实存在即可。原先要求各占 1%，短标签（2~3 个字）在
+    // 480×160 的取样区里不到 1%，会被误判成“没有文字”。
+    if (below < 8 || above < 8) return false;
 
     thr = bestT;
     darkText = below <= above;   // 文字是少数派
