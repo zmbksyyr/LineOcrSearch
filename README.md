@@ -1,5 +1,7 @@
 # LineOcrSearch
 
+[![build](https://github.com/zmbksyyr/LineOcrSearch/actions/workflows/build.yml/badge.svg)](https://github.com/zmbksyyr/LineOcrSearch/actions/workflows/build.yml)
+
 鼠标停在屏幕文字上，就在指定文件夹里把这段话搜出来。Windows 10/11 x64，单 exe，免安装，全离线。
 
 ## 用法
