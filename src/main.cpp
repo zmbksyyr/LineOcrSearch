@@ -74,6 +74,7 @@ struct SearchResultMsg {
 // 取词线程 -> 主线程的结果包裹
 struct CaptureResultMsg {
     POINT pt = {};
+    unsigned seq = 0;               // 取词代次：超时后旧线程的结果作废
     Settings settings;              // 启动线程时的设置快照
     bool   got = false;
     std::wstring raw, src, fail;
@@ -82,6 +83,7 @@ struct CaptureResultMsg {
     bool   haveX = false;
     bool   estimated = false;
     int    alignPct = -1;
+    float  confidence = -1.0f;      // OCR 置信度；UIA/控件为 -1
 };
 
 
@@ -92,6 +94,9 @@ static DWORD    g_stillSince = 0;
 static DWORD    g_lastAttempt = 0;
 static bool     g_fired = false;
 static int      g_attemptsAtPoint = 0;   // 同一个静止点位已经取过几次（失败就放弃）
+static unsigned g_captureSeq = 0;        // 取词代次：超时后丢弃旧线程结果
+static DWORD    g_captureStart = 0;
+static bool     g_userEditing = false;    // 用户正在改输入框：先别自动取词覆盖
 static std::wstring g_lastCaptured;
 static std::wstring g_lastCapturedRoot;
 static bool     g_autoBacktrack = false;
@@ -524,6 +529,7 @@ struct PickCandidate {
     bool estimated = false; // 是否按元素矩形估算
     int lineH = 20;
     int alignPct = -1;
+    float confidence = -1.0f;
 };
 
 static bool MakeCandidate(const std::wstring& raw, const std::wstring& src,
@@ -604,9 +610,10 @@ static bool CaptureOcrCandidate(POINT p, PickCandidate& out, std::wstring& fail)
     std::wstring t;
     std::vector<double> v;
     int lt = 0, lb = 0, reject = 0;
+    float confidence = 0.0f;
     bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h,
                                cap.mouseLocalX, cap.mouseLocalY,
-                               t, &lt, &lb, &v, &reject);
+                               t, &lt, &lb, &v, &reject, &confidence);
     int mx = cap.mouseLocalX;
     int lineH = (lb - lt + 1);
     WipeBytes(cap.px);
@@ -619,6 +626,7 @@ static bool CaptureOcrCandidate(POINT p, PickCandidate& out, std::wstring& fail)
         fail = out.fail;
         return false;
     }
+    out.confidence = confidence;
     return true;
 }
 
@@ -641,6 +649,7 @@ static bool AlignOcrToUia(POINT p, const PickCandidate& ocr, PickCandidate& out)
     PickCandidate c;
     if (!MakeCandidate(wt, L"智能 · 对齐", wx, ocr.mouseX, ocr.lineH, false, false, c)) return false;
     c.alignPct = (int)(ar.ratio * 100.0 + 0.5);
+    c.confidence = ocr.confidence;
     out = c;
     return true;
 }
@@ -652,6 +661,7 @@ static int CandidateScore(const PickCandidate& c) {
     if (c.exact) score += 4;
     if (c.estimated) score -= 2;
     if (c.src.find(L"UIA") != std::wstring::npos) score += 2;
+    if (c.confidence >= 0.0f) score += (int)(c.confidence * 6.0f + 0.5f);
     return score;
 }
 
@@ -689,8 +699,9 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
             chosen = native;
         } else if (uia.ok && ocr.ok) {
             if (uia.exact) {
-                double sim = TextSimilarity(uia.block, ocr.block);
-                chosen = (sim >= 0.35 || CountTextChars(ocr.block) < 4) ? uia : ocr;
+                double sim = TextSimilarityOrdered(uia.block, ocr.block);
+                bool ocrWeak = (ocr.confidence >= 0.0f && ocr.confidence < 0.50f);
+                chosen = (ocrWeak || sim >= 0.35 || CountTextChars(ocr.block) < 4) ? uia : ocr;
                 if (chosen.ok) chosen.alignPct = (int)(sim * 100.0 + 0.5);
             } else {
                 PickCandidate aligned;
@@ -722,6 +733,7 @@ static void CaptureFlow(const Settings& st, POINT p, CaptureResultMsg* out) {
     out->haveX = chosen.haveX;
     out->estimated = chosen.estimated;
     out->alignPct = chosen.alignPct;
+    out->confidence = chosen.confidence;
     out->fail.clear();
 }
 
@@ -738,6 +750,7 @@ static DWORD WINAPI CaptureThreadProc(LPVOID param) {
 
 // 主线程收取词结果：只做 UI 更新与触发搜索
 static void OnCaptureDone(CaptureResultMsg* msg) {
+    if (msg->seq != g_captureSeq) { delete msg; return; }   // 超时后旧线程的结果
     InterlockedExchange(&g.capturing, 0);
 
     if (!msg->got) {
@@ -762,6 +775,10 @@ static void OnCaptureDone(CaptureResultMsg* msg) {
     std::wstring note = L"已取词 · " + msg->src;
     if (msg->alignPct >= 0) note += L" · 与 UIA 重合 " + std::to_wstring(msg->alignPct) + L"%";
     if (msg->estimated) note += L" · 位置为估算";
+    if (msg->confidence >= 0.0f && msg->confidence < 0.65f) {
+        note += L" · 识别置信度 " +
+                std::to_wstring((int)(msg->confidence * 100.0f + 0.5f)) + L"%";
+    }
     SetLeftStatus(note);
 
     if (clean == g_lastCaptured && g.settings.rootDir == g_lastCapturedRoot) {
@@ -803,7 +820,14 @@ static void OnPollTick() {
         g_stillSince = GetTickCount();
         g_fired = false;
         g_attemptsAtPoint = 0;
+        g_userEditing = false;
         SetLeftStatus(L"");
+        return;
+    }
+
+    // 用户正在改关键词：不要用下一次自动取词把输入框覆盖掉。
+    if (g_userEditing) {
+        SetLeftStatus(L"正在编辑关键词 · 移动鼠标后可继续取词");
         return;
     }
 
@@ -835,6 +859,18 @@ static void OnPollTick() {
 
     // 同一点位允许重试：上次尝试后冷却 1.2 秒，避免连续截屏
     DWORD now = GetTickCount();
+
+    // 某个程序的 UIA 调用可能永久卡住。超过 6 秒就作废这一次，
+    // 让后续取词还能继续；旧线程若之后返回，按代次丢弃。
+    if (g.capturing && (DWORD)(now - g_captureStart) > 6000) {
+        ++g_captureSeq;
+        InterlockedExchange(&g.capturing, 0);
+        g_fired = false;
+        g_attemptsAtPoint = 0;
+        SetLeftStatus(L"取词超时，已恢复 · 请重新移动鼠标");
+        return;
+    }
+
     if (g_fired && (DWORD)(now - g_lastAttempt) < 1200) return;
 
     // 同一个点连续 3 次都没取到文字就停下来：鼠标停在桌面/图片/按钮上时，
@@ -854,6 +890,8 @@ static void OnPollTick() {
 
     CaptureResultMsg* msg = new CaptureResultMsg();
     msg->pt = p;
+    msg->seq = ++g_captureSeq;
+    g_captureStart = now;
     msg->settings = g.settings;   // 快照：线程跑期间改设置不影响这一次
     HANDLE th = CreateThread(nullptr, 0, CaptureThreadProc, msg, 0, nullptr);
     if (th) {
@@ -1242,11 +1280,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND: {
             int id = LOWORD(wp);
             if (id == IDC_EDIT && HIWORD(wp) == EN_CHANGE) {
-                // 用户自己改了内容：整段都算「实际在用」，取消置灰
-                if (!g_editSilent && (g_dimFrom != (size_t)-1 || g_usedStart != 0)) {
-                    g_usedStart = 0;
-                    g_dimFrom = (size_t)-1;
-                    EditPaintColors(true);
+                // 用户自己改了内容：整段都算「实际在用」，取消置灰；
+                // 同时先停掉自动取词，免得用户打字打到一半被下一次取词覆盖。
+                if (!g_editSilent) {
+                    g_userEditing = true;
+                    if (g_dimFrom != (size_t)-1 || g_usedStart != 0) {
+                        g_usedStart = 0;
+                        g_dimFrom = (size_t)-1;
+                        EditPaintColors(true);
+                    }
                 }
                 return 0;
             }

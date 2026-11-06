@@ -143,8 +143,9 @@ int main() {
         std::wstring t;
         std::vector<double> xs;
         int lt = 0, lb = 0, rej = 0;
+        float conf = 0.0f;
         bool ok = OcrRecognizeBgra(cap.px.data(), cap.w, cap.h, cap.mouseLocalX,
-                                   cap.mouseLocalY, t, &lt, &lb, &xs, &rej);
+                                   cap.mouseLocalY, t, &lt, &lb, &xs, &rej, &conf);
         int mx = cap.mouseLocalX;
         WipeBytes(cap.px);
         if (!ok) {
@@ -155,8 +156,9 @@ int main() {
         std::wstring seg = (xs.size() == t.size())
             ? TakeRightOfCursor(t, xs, (double)mx)
             : TakeRightOfCursor(t, std::vector<double>(), 0.0);
-        printf("[probe %d] raw=[%s]\n           seg=[%s]\n", k, U8(t).c_str(), U8(seg).c_str());
+        printf("[probe %d] conf=%.3f raw=[%s]\n           seg=[%s]\n", k, conf, U8(t).c_str(), U8(seg).c_str());
         if (seg.find(need[k]) == std::wstring::npos) ++fails;
+        if (conf < 0.70f) ++fails;
     }
 
     if (capFails == 3) {

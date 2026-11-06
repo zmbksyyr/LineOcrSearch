@@ -133,6 +133,9 @@ inline int MaxRightGap(int lineH) {
 // 两段文字的字符重合度 0..1（字符频次交集 / 较长者长度）。
 // 用来判断 UIA 与图片认的是不是同一句：差距大就以图片为准。
 double TextSimilarity(const std::wstring& a, const std::wstring& b);
+// 顺序敏感的重合度（LCS / 较长者长度）。字符相同但顺序/切分不同时，
+// 它比 TextSimilarity 更能分清“同一句”与“只是用了同一批字”。
+double TextSimilarityOrdered(const std::wstring& a, const std::wstring& b);
 int          CountTextChars(const std::wstring& s);
 
 // ---- 搜索（阻塞，调用方放后台线程）----
@@ -201,11 +204,14 @@ bool        OcrReady();
 //   Y 决定「第几行」，X 决定「这一行在笔尖右侧有没有字」——右侧整段空白的行不参与候选。
 // reject（可选）：0 = 条带里压根没有文字行；1 = 有行，但都过不了锚点门槛
 //   （笔尖右边没字 / 右侧空白太远），用来给状态栏更准的提示。
+// confidence（可选）：识别结果每个字 top-1 概率的均值（0..1），
+//   用来区分正常文字与图标/噪声乱码。
 bool        OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
                              int mouseX, int mouseY,
                              std::wstring& text, int* lineTop, int* lineBottom,
                              std::vector<double>* charX = nullptr,
-                             int* reject = nullptr);
+                             int* reject = nullptr,
+                             float* confidence = nullptr);
 std::wstring OcrEngineInfo();
 
 // ---- 对齐：把 OCR 认出来的一行对到 UIA 全文的对应片段 ----

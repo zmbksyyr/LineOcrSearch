@@ -247,18 +247,28 @@ static bool OtsuInRect(const std::vector<unsigned char>& gray, int w,
     return true;
 }
 
-// 把 (top,bottom) 高度超过 maxH 的块在前景最少的谷底行切开；切不动就整块保留。
+// 把块在“前景最少的谷底行”切开：既处理高度超过 maxH 的粘连行，
+// 也处理两行贴得很近（总高不到 maxH）但中间有明显空白的情况。
+// 谷底只在中间三分之一找，避免把单行字的上下边缘误当成行间空白。
 static void SplitTallSpan(const std::vector<int>& rowFg, int top, int bottom, int maxH,
                           std::vector<LineSpan>& out) {
     int hgt = bottom - top + 1;
-    if (hgt <= maxH || bottom >= (int)rowFg.size()) {
-        if (hgt >= 5) { LineSpan s; s.top = top; s.bottom = bottom; out.push_back(s); }
-        return;
-    }
+    if (bottom >= (int)rowFg.size() || hgt < 5) return;
+
+    int peak = 0;
+    for (int y = top; y <= bottom; ++y) if (rowFg[y] > peak) peak = rowFg[y];
+
+    int lo = top + hgt / 3, hi = bottom - hgt / 3;
     int best = -1, bestV = 1 << 30;
-    int lo = top + 6, hi = bottom - 6;
     for (int y = lo; y <= hi; ++y) {
         if (rowFg[y] < bestV) { bestV = rowFg[y]; best = y; }
+    }
+
+    bool tooTall = (hgt > maxH);
+    bool deepValley = (hgt >= 26 && peak > 0 && best >= 0 && bestV * 5 < peak);
+    if (!tooTall && !deepValley) {
+        LineSpan s; s.top = top; s.bottom = bottom; out.push_back(s);
+        return;
     }
     if (best < 0 || best - top < 6 || bottom - best < 6) {
         LineSpan s; s.top = top; s.bottom = bottom; out.push_back(s);
@@ -275,6 +285,7 @@ struct RightLine {
     int top = 0;
     int bottom = 0;
     int firstX = 0;     // 锚点右侧第一段墨迹的左边界（条带坐标）
+    int endX = 0;       // 同一列文字的右边界（遇到大空白/下一列就停）
     int gap = 0;        // 这段墨迹离鼠标的距离（<=0 表示鼠标压在字上）
     int lineH = 0;
 };
@@ -401,6 +412,22 @@ static RightLine FindRightLine(const std::vector<unsigned char>& gray, int w, in
     if (out.gap < 0) out.gap = 0;
     if (out.gap > MaxRightGap(lineH)) { if (reject) *reject = 1; return out; }
 
+    // 只识别鼠标所在的那一列：遇到明显大于正常字间空格的空白就停。
+    // 表格/文件列表的列间距通常大于这个值；正常字间空格/全角空格不会。
+    int colGap = lineH + 6;
+    if (colGap < 20) colGap = 20;
+    int zero = 0;
+    out.endX = w;
+    for (int cx = anchorL; cx < w; ++cx) {
+        if (colFg[cx] > 0) {
+            zero = 0;
+        } else if (++zero > colGap) {
+            out.endX = cx - zero + 1;
+            break;
+        }
+    }
+    if (out.endX - anchorL < 6) out.endX = w;
+
     out.ok = true;
     return out;
 }
@@ -457,10 +484,13 @@ static void ResizeGrayToFloat(const std::vector<unsigned char>& gray, int sw, in
 // ---------------- CTC 解码 ----------------
 
 // 第 t 步对应整幅缩放图宽度上的 x ≈ (t+0.5)*srcW/T，再用于按鼠标位置取段。
+// confidence 为已输出字符的 top-1 概率均值，用来区分“正常文字”和图标/噪声乱码。
 static std::wstring CtcDecode(const float* data, int T, int C, int srcW,
-                              std::vector<double>& charX) {
+                              std::vector<double>& charX, float* confidence) {
     std::wstring res;
     charX.clear();
+    double confSum = 0.0;
+    int confN = 0;
     int prev = -1;
     for (int t = 0; t < T; ++t) {
         const float* p = data + (size_t)t * C;
@@ -478,10 +508,13 @@ static std::wstring CtcDecode(const float* data, int T, int C, int srcW,
             if (ch && !ch->empty()) {
                 res += *ch;
                 charX.push_back((double)(t + 0.5) * (double)srcW / (double)T);
+                confSum += (double)bv;
+                ++confN;
             }
         }
         prev = best;
     }
+    if (confidence) *confidence = confN ? (float)(confSum / confN) : 0.0f;
     return res;
 }
 
@@ -490,9 +523,11 @@ static std::wstring CtcDecode(const float* data, int T, int C, int srcW,
 // 对灰度图的 [top..bottom] 行、[x0..x1) 列跑一次模型，输出文字与每字 x（条带坐标）。
 static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
                           int top, int bottom, int x0, int x1,
-                          std::wstring& text, std::vector<double>* charX) {
+                          std::wstring& text, std::vector<double>* charX,
+                          float* confidence = nullptr) {
     text.clear();
     if (charX) charX->clear();
+    if (confidence) *confidence = 0.0f;
 
     if (x0 < 0) x0 = 0;
     if (x1 > w) x1 = w;
@@ -547,7 +582,7 @@ static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
             if (stData) {
                 g_ort->ReleaseStatus(stData);
             } else if (raw && T > 0 && C > 0) {
-                result = CtcDecode((const float*)raw, T, C, srcW, xs);
+                result = CtcDecode((const float*)raw, T, C, srcW, xs, confidence);
                 for (double& v : xs) v += (double)x0;
             }
         }
@@ -563,12 +598,13 @@ static bool RecognizeSpan(const std::vector<unsigned char>& gray, int w, int h,
 bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
                       int mouseX, int mouseY,
                       std::wstring& text, int* lineTop, int* lineBottom,
-                      std::vector<double>* charX, int* reject) {
+                      std::vector<double>* charX, int* reject, float* confidence) {
     text.clear();
     if (charX) charX->clear();
     if (lineTop) *lineTop = 0;
     if (lineBottom) *lineBottom = 0;
     if (reject) *reject = 0;
+    if (confidence) *confidence = 0.0f;
     if (!g_sess || !bgra || w <= 0 || h <= 0) return false;
 
     std::vector<unsigned char> gray;
@@ -579,7 +615,8 @@ bool OcrRecognizeBgra(const unsigned char* bgra, int w, int h,
 
     std::wstring t;
     std::vector<double> xs;
-    if (!RecognizeSpan(gray, w, h, line.top, line.bottom, line.firstX, w, t, &xs)) return false;
+    if (!RecognizeSpan(gray, w, h, line.top, line.bottom, line.firstX, line.endX, t, &xs,
+                       confidence)) return false;
     if (CountTextChars(t) < 1) return false;
 
     text = t;

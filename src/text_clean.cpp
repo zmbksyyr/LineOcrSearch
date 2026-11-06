@@ -265,6 +265,36 @@ double TextSimilarity(const std::wstring& a, const std::wstring& b) {
     return (double)common / (double)m;
 }
 
+// 顺序敏感的重合度：LCS / 较长者长度。用于智能模式判断 UIA 与 OCR
+// 是不是同一句——只用字符频次时，“闭塞设备”和“设备闭塞”会被判成一样。
+double TextSimilarityOrdered(const std::wstring& a, const std::wstring& b) {
+    std::wstring x, y;
+    x.reserve(a.size());
+    y.reserve(b.size());
+    for (wchar_t c : a) if (!iswspace(c)) x.push_back(c);
+    for (wchar_t c : b) if (!iswspace(c)) y.push_back(c);
+    if (x.empty() || y.empty()) return 0.0;
+    if (x.size() > 600 || y.size() > 600 || x.size() * y.size() > 250000) {
+        return TextSimilarity(a, b);
+    }
+    if (!x.empty()) CharUpperBuffW(&x[0], (DWORD)x.size());
+    if (!y.empty()) CharUpperBuffW(&y[0], (DWORD)y.size());
+
+    const size_t n = x.size(), m = y.size();
+    std::vector<int> prev(m + 1, 0), cur(m + 1, 0);
+    for (size_t i = 1; i <= n; ++i) {
+        cur[0] = 0;
+        for (size_t j = 1; j <= m; ++j) {
+            if (x[i - 1] == y[j - 1]) cur[j] = prev[j - 1] + 1;
+            else cur[j] = (prev[j] > cur[j - 1]) ? prev[j] : cur[j - 1];
+        }
+        prev.swap(cur);
+    }
+    size_t lcs = (size_t)prev[m];
+    size_t big = (n > m) ? n : m;
+    return (double)lcs / (double)big;
+}
+
 int CountTextChars(const std::wstring& s) {
     if (s.empty()) return 0;
     std::vector<CharKind> kind;

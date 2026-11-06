@@ -146,6 +146,14 @@ static void TestTakeRight() {
     Check(TextSimilarity(L"Microsoft Edge", L"Microsoft Edge (8)") > 0.8,
           "same words with a counter -> high");
     Check(TextSimilarity(L"闭塞设备", L"闭塞设备") == 1.0, "cjk identical");
+
+    printf("-- TextSimilarityOrdered --\n");
+    Check(TextSimilarityOrdered(L"状态栏", L"状态栏") > 0.999, "ordered identical");
+    Check(TextSimilarityOrdered(L"图标", L"状态栏") < 0.1, "ordered unrelated");
+    Check(TextSimilarityOrdered(L"Microsoft Edge", L"Microsoft Edge (8)") > 0.8,
+          "ordered same words with counter");
+    Check(TextSimilarityOrdered(L"闭塞设备", L"设备闭塞") < 0.7,
+          "reordered chars score lower than bag-of-chars");
 }
 
 static void TestSearch() {
