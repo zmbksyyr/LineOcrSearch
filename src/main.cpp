@@ -65,6 +65,7 @@ static int DpiForWindowCompat(HWND hwnd) {
 
 struct SearchResultMsg {
     unsigned seq;
+    volatile LONG cancel = 0;    // 新搜索来了就置 1，让旧搜索尽快收手
     // 请求在主线程填好再交给工作线程：线程里一律不碰 g.settings
     // （主线程可能正在保存设置/拖入新文件夹，std::wstring 赋值不是原子的）
     SearchRequest req;
@@ -107,6 +108,7 @@ static const int kMaxBacktrack = 12;
 static std::wstring g_pendingKeyword;
 static bool     g_pendingFromCapture = false;
 static bool     g_hasPendingSearch = false;
+static volatile LONG* g_currentSearchCancel = nullptr;
 static bool     g_inSizeMove = false;   // 用户正在拖动窗口边缘：列表重测延后
 
 // ---------------- 能力探测 ----------------
@@ -412,11 +414,12 @@ static void StartSearch(const std::wstring& keyword, bool fromCapture = false) {
         return;
     }
     if (InterlockedCompareExchange(&g.searching, 1, 0) != 0) {
-        // 上一次还在搜：挂起最新一次，等 OnResults 结束后补跑，不静默丢弃。
+        // 上一次还在搜：让它尽快收手，并挂起最新一次，搜完立即重跑。
+        if (g_currentSearchCancel) InterlockedExchange(g_currentSearchCancel, 1);
         g_pendingKeyword = kw;
         g_pendingFromCapture = fromCapture;
         g_hasPendingSearch = true;
-        g.statusNote = L"上一次搜索还在进行，完成后自动重搜";
+        g.statusNote = L"正在取消上一次搜索，随后重搜…";
         SetStatus();
         return;
     }
@@ -435,7 +438,9 @@ static void StartSearch(const std::wstring& keyword, bool fromCapture = false) {
     msg->req.searchOffice = g.settings.searchOffice;
     msg->req.contextLevel = g.settings.contextLevel;
     msg->req.maxResults   = g.settings.maxResults;
+    msg->req.cancel       = &msg->cancel;
     msg->outcome.keyword  = kw;
+    g_currentSearchCancel = &msg->cancel;
 
     g.selected = -1;
     g.scrollY  = 0;
@@ -446,6 +451,7 @@ static void StartSearch(const std::wstring& keyword, bool fromCapture = false) {
     HANDLE th = CreateThread(nullptr, 0, SearchThreadProc, msg, 0, nullptr);
     if (th) CloseHandle(th);
     else {
+        g_currentSearchCancel = nullptr;
         delete msg;
         InterlockedExchange(&g.searching, 0);
     }
@@ -972,9 +978,10 @@ void ShowMoreResults() {
 
 static void OnResults(SearchResultMsg* msg) {
     bool needBacktrack = false;
+    bool canceled = msg->outcome.canceled;
     std::wstring nextKw;
 
-    if (msg->seq == g.seq) {
+    if (!canceled && msg->seq == g.seq) {
         g.outcome = std::move(msg->outcome);
         g.selected = -1;
         g.scrollY  = 0;
@@ -998,8 +1005,23 @@ static void OnResults(SearchResultMsg* msg) {
         SetStatus();
     }
 
+    if (g_currentSearchCancel == &msg->cancel) g_currentSearchCancel = nullptr;
     InterlockedExchange(&g.searching, 0);
     delete msg;
+
+    if (canceled) {
+        g.statusNote = L"上一次搜索已取消";
+        if (g_hasPendingSearch) {
+            std::wstring kw = g_pendingKeyword;
+            bool cap = g_pendingFromCapture;
+            g_hasPendingSearch = false;
+            g_pendingKeyword.clear();
+            StartSearch(kw, cap);
+        } else {
+            SetStatus();
+        }
+        return;
+    }
 
     if (needBacktrack) {
         ++g_backtrackTries;

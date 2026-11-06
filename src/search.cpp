@@ -272,6 +272,10 @@ struct Walker {
     std::vector<FileBucket> buckets;    // 有命中的文件，按遍历顺序追加
     int collected = 0;                  // 已收集条数（受 kMaxCollect 约束）
 
+    bool Canceled() const {
+        return req && req->cancel && *req->cancel != 0;
+    }
+
     void HandleFile(const std::wstring& full, const std::wstring& rel, const std::wstring& name,
                     unsigned size, unsigned long long mtime);
     void Walk(const std::wstring& dir, const std::wstring& rel, int depth);
@@ -279,6 +283,7 @@ struct Walker {
 
 void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const std::wstring& name,
                         unsigned size, unsigned long long mtime) {
+    if (Canceled()) { out->canceled = true; return; }
     if (collected >= kMaxCollect) { out->truncated = true; return; }
 
     std::wstring ext = LowerExt(name);
@@ -309,6 +314,7 @@ void Walker::HandleFile(const std::wstring& full, const std::wstring& rel, const
     int hits = 0;
     size_t bucketIdx = buckets.size();     // 有命中才开始建桶
     for (size_t i = 0; i < lines.size() && hits < kHitsPerFile; ++i) {
+        if ((i & 63) == 0 && Canceled()) { out->canceled = true; return; }
         if (collected >= kMaxCollect) { out->truncated = true; break; }
 
         const std::wstring& line = lines[i];
@@ -375,6 +381,7 @@ void Walker::Walk(const std::wstring& dir, const std::wstring& rel, int depth) {
     if (depth > kMaxDepth) return;
     if (collected >= kMaxCollect) { out->truncated = true; return; }
     if (out->scannedFiles > kMaxScanned) return;
+    if (Canceled()) { out->canceled = true; return; }
 
     std::wstring pattern = JoinPath(dir, L"*");
     WIN32_FIND_DATAW fd{};

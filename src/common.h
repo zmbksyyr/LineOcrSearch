@@ -61,6 +61,7 @@ struct SearchRequest {
     bool searchOffice  = true;
     int  contextLevel  = 1;
     int  maxResults    = 200;
+    volatile LONG* cancel = nullptr;  // 非空时轮询：新搜索来了就尽快收手
 };
 
 struct SearchOutcome {
@@ -71,6 +72,7 @@ struct SearchOutcome {
     int  totalHits    = 0;            // 命中总条数（跨所有文件，受收集上限约束）
     int  totalFiles   = 0;            // 有命中的文件数
     bool truncated    = false;        // 收集阶段撞到上限，还有内容没进来
+    bool canceled     = false;        // 被新搜索打断，结果不应显示
 };
 
 // ---- 数据目录布局（目录名集中在这里，改组织方式只动这一处）----
